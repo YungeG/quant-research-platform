@@ -50,6 +50,18 @@ def _plain(value: object) -> Any:
     return json.loads(canonical_bytes(value))
 
 
+def _outcome_payloads(foundation: LocalFoundation) -> list[dict[str, Any]]:
+    outcomes: list[dict[str, Any]] = []
+    for entry in foundation.entries("research.execution.v1"):
+        try:
+            envelope = json.loads(entry.payload)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            pytest.fail(f"Research execution entry is not canonical JSON: {error}")
+        if envelope["artifact_type"] == "task_outcome":
+            outcomes.append(envelope["payload"])
+    return outcomes
+
+
 def _artifact_ref(artifact_type: str, marker: str) -> dict[str, object]:
     return {
         "type": "artifact_ref",
@@ -271,11 +283,7 @@ def test_real_research_golden_replays_without_a_second_economic_run(tmp_path: Pa
     assert provider.run_calls == 4
     assert provider.derive_calls == 3
     assert provider.reservations_before_run == [1, 2, 3, 4]
-    execution = [
-        json.loads(entry.payload)["payload"]
-        for entry in foundation.entries("research.execution.v1")
-        if json.loads(entry.payload)["artifact_type"] == "task_outcome"
-    ]
+    execution = _outcome_payloads(foundation)
     assert [item["state"] for item in execution].count("COMPLETED") == 6
     assert [item["state"] for item in execution].count("BLOCKED") == 2
     assert len(attempts) == 7
@@ -297,10 +305,6 @@ def test_real_repository_failure_remains_local_and_publishes_no_candidate(
     result = execute_experiment(inputs, foundation, ledger, provider)
 
     assert type(result).__name__ == "PublishedNoSelection"
-    outcomes = [
-        json.loads(entry.payload)["payload"]
-        for entry in foundation.entries("research.execution.v1")
-        if json.loads(entry.payload)["artifact_type"] == "task_outcome"
-    ]
+    outcomes = _outcome_payloads(foundation)
     assert all("backtest_terminal" not in item["witness"] for item in outcomes)
     assert any("local_failure" in item["witness"] for item in outcomes)
