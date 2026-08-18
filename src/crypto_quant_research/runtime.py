@@ -18,11 +18,20 @@ from .integration import (
     RESEARCH_EXECUTION_LOG,
     AnalysisTask,
     CandidateFamily,
+    DataSlice,
     DependencyBlock,
     ExecutionEntry,
     ExperimentExecutionManifest,
     ExperimentSpec,
+    FeatureBuildTask,
+    FeatureDatasetManifest,
+    FeatureDatasetPublication,
+    FeatureRecipe,
     LocalFailure,
+    ModelBuildEvidence,
+    ModelBuildPlan,
+    ModelBuildPublication,
+    ModelTrainingTask,
     NoSelection,
     ResearchCoreError,
     SelectionDeclaration,
@@ -31,8 +40,10 @@ from .integration import (
     TaskAttemptStarted,
     TaskOutcome,
     TaskRef,
+    TrainerRecipe,
     TrialCompletedPublication,
     TrialDeclaration,
+    UpstreamTaskOutcome,
     VerifiedAnalysis,
     block_analysis_from_upstream,
     build_candidate_family,
@@ -42,6 +53,7 @@ from .integration import (
     map_backtest_observation,
     select_candidate,
     validate_execution_prefix,
+    validate_model_build,
 )
 
 _RESEARCH_ARTIFACTS_LOG = "research.artifacts.v1"
@@ -101,8 +113,10 @@ def _publish(
     log_name: str,
     artifact_type: str,
     payload: object,
+    *,
+    schema_version: int = 1,
 ):
-    envelope = ArtifactEnvelope.create(artifact_type, 1, payload)
+    envelope = ArtifactEnvelope.create(artifact_type, schema_version, payload)
     ref = foundation.put(envelope=envelope)
     receipt = foundation.append(
         log_name,
@@ -238,6 +252,59 @@ class FrozenExperimentInputs:
 
 
 @dataclass(frozen=True, slots=True)
+class FrozenModelExperimentInputs:
+    experiment_spec: ExperimentSpec
+    feature_recipe: FeatureRecipe
+    trainer_recipe: TrainerRecipe
+    model_build_plan: ModelBuildPlan
+    selection_policy: SelectionPolicy
+    selection_declared_by_ref: object
+    reservation_at: str
+    max_attempts: int = 1
+
+    def __post_init__(self) -> None:
+        expected = (
+            ("experiment_spec", self.experiment_spec, ExperimentSpec),
+            ("feature_recipe", self.feature_recipe, FeatureRecipe),
+            ("trainer_recipe", self.trainer_recipe, TrainerRecipe),
+            ("model_build_plan", self.model_build_plan, ModelBuildPlan),
+            ("selection_policy", self.selection_policy, SelectionPolicy),
+        )
+        for name, value, expected_type in expected:
+            if type(value) is not expected_type:
+                raise TypeError(f"{name} must be exact {expected_type.__name__}")
+        if type(self.max_attempts) is not int or self.max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
+        if (
+            self.experiment_spec.model_build_plan != self.model_build_plan.ref
+            or self.model_build_plan.feature_recipe_ref != self.feature_recipe.ref
+            or self.model_build_plan.trainer_recipe_ref != self.trainer_recipe.ref
+        ):
+            raise ResearchCoreError("MODEL_BUILD_PLAN_INVALID")
+        if not any(
+            _wire(self.selection_policy.metric_profile_ref) == _wire(profile_ref)
+            for profile_ref in self.experiment_spec.metric_profile_refs
+        ):
+            raise ResearchCoreError("SELECTION_POLICY_MISMATCH")
+        declaration = SelectionDeclaration(
+            self.experiment_spec.ref,
+            self.selection_policy.ref,
+            "candidate_trial_declarations_v1",
+            _plain(self.selection_declared_by_ref),
+        )
+        record = SampleConsumptionRecord(
+            self.model_build_plan.training_slice.dataset_revision,
+            self.model_build_plan.training_slice.interval_start,
+            self.model_build_plan.training_slice.interval_end,
+            "feature_build",
+            "preflight",
+            self.reservation_at,
+        )
+        object.__setattr__(self, "selection_declared_by_ref", declaration.declared_by_ref)
+        object.__setattr__(self, "reservation_at", record.consumed_at)
+
+
+@dataclass(frozen=True, slots=True)
 class PublishedStrategyCandidate:
     strategy_candidate_ref: ArtifactRef
     candidate_family_ref: ArtifactRef
@@ -255,7 +322,7 @@ class PublishedNoSelection:
 
 @dataclass
 class _PublishedBase:
-    inputs: FrozenExperimentInputs
+    inputs: FrozenExperimentInputs | FrozenModelExperimentInputs
     trials: tuple[TrialDeclaration, ...]
     universe: tuple[TaskRef, ...]
     trial_tasks: dict[str, TaskRef]
@@ -264,6 +331,7 @@ class _PublishedBase:
     selection_ref: ArtifactRef
     selection_ledger_sequence: int
     trial_specs: dict[str, ArtifactRef]
+    model_build_evidence_ref: ArtifactRef | None = None
 
     @property
     def experiment_ref(self) -> ArtifactRef:
@@ -301,8 +369,41 @@ def _normal_inputs(value: object) -> FrozenExperimentInputs:
     )
 
 
+def _normal_model_inputs(value: object) -> FrozenModelExperimentInputs:
+    if type(value) is not FrozenModelExperimentInputs:
+        raise TypeError("frozen_inputs must be FrozenModelExperimentInputs")
+    return FrozenModelExperimentInputs(
+        value.experiment_spec,
+        value.feature_recipe,
+        value.trainer_recipe,
+        value.model_build_plan,
+        value.selection_policy,
+        value.selection_declared_by_ref,
+        value.reservation_at,
+        value.max_attempts,
+    )
+
+
+def _require_model_builder(builder: object) -> None:
+    if not all(
+        callable(getattr(builder, name, None))
+        for name in ("build_features", "train_model")
+    ):
+        raise TypeError("builder must expose build_features and train_model")
+
+
+def _require_model_backtest(backtest: object) -> None:
+    _require_backtest(backtest)
+    if not callable(getattr(backtest, "prepare_trials", None)):
+        raise TypeError("backtest must expose prepare_trials for model experiments")
+
+
 def _publish_base(
-    inputs: FrozenExperimentInputs, foundation: LocalFoundation
+    inputs: FrozenExperimentInputs | FrozenModelExperimentInputs,
+    foundation: LocalFoundation,
+    *,
+    initial_refs: Mapping[str, ArtifactRef] | None = None,
+    publish_trial_specs: bool = True,
 ) -> _PublishedBase:
     spec = inputs.experiment_spec
     trials = build_trial_declarations(spec)
@@ -310,7 +411,7 @@ def _publish_base(
     trial_tasks = {
         task.task_artifact_ref: task for task in universe if task.kind == "TRIAL"
     }
-    refs: dict[str, ArtifactRef] = {}
+    refs: dict[str, ArtifactRef] = dict(initial_refs or {})
 
     experiment_ref, _ = _publish(
         foundation, _RESEARCH_ARTIFACTS_LOG, "experiment_spec", spec.payload
@@ -326,19 +427,25 @@ def _publish_base(
         )
         refs[trial.ref] = ref
 
+    task_types = {
+        "ANALYSIS": (AnalysisTask, "analysis_task"),
+        "FEATURE_BUILD": (FeatureBuildTask, "feature_build_task"),
+        "MODEL_TRAINING": (ModelTrainingTask, "model_training_task"),
+    }
     for task in universe:
-        if task.kind != "ANALYSIS":
+        if task.kind not in task_types:
             continue
-        analysis = task.artifact
-        if type(analysis) is not AnalysisTask:
+        expected_type, artifact_type = task_types[task.kind]
+        artifact = task.artifact
+        if type(artifact) is not expected_type:
             raise ResearchCoreError("TASK_OUTCOME_INVALID")
         ref, _ = _publish(
             foundation,
             _RESEARCH_ARTIFACTS_LOG,
-            "analysis_task",
-            _translate(analysis.payload, refs),
+            artifact_type,
+            _translate(artifact.payload, refs),
         )
-        refs[analysis.ref] = ref
+        refs[artifact.ref] = ref
 
     policy_ref, _ = _publish(
         foundation,
@@ -361,23 +468,7 @@ def _publish_base(
     )
     refs[selection.ref] = selection_ref
 
-    executions = {item.trial_declaration_ref: item for item in inputs.trial_executions}
-    trial_specs: dict[str, ArtifactRef] = {}
-    for trial in trials:
-        execution = executions[trial.ref]
-        ref, _ = _publish(
-            foundation,
-            _RESEARCH_ARTIFACTS_LOG,
-            "backtest_trial_spec",
-            {
-                "trial_declaration_ref": _ref_payload(refs[trial.ref]),
-                "resolved_model_refs": list(execution.resolved_model_refs),
-                "backtest_request_ref": execution.backtest_request_ref,
-            },
-        )
-        trial_specs[trial.ref] = ref
-
-    return _PublishedBase(
+    base = _PublishedBase(
         inputs,
         trials,
         universe,
@@ -386,18 +477,112 @@ def _publish_base(
         selection,
         selection_ref,
         selection_receipt.ledger_sequence,
-        trial_specs,
+        {},
     )
+    if publish_trial_specs:
+        if type(inputs) is not FrozenExperimentInputs:
+            raise TypeError("trial specs require FrozenExperimentInputs")
+        _publish_trial_specs(base, foundation, inputs.trial_executions)
+    return base
 
 
-def _reserve(
+def _publish_trial_specs(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+    executions: tuple[TrialExecution, ...],
+) -> None:
+    by_trial = {item.trial_declaration_ref: item for item in executions}
+    if set(by_trial) != {trial.ref for trial in base.trials}:
+        raise ResearchCoreError("TASK_REF_FOREIGN")
+    for trial in base.trials:
+        execution = by_trial[trial.ref]
+        ref, _ = _publish(
+            foundation,
+            _RESEARCH_ARTIFACTS_LOG,
+            "backtest_trial_spec",
+            {
+                "trial_declaration_ref": _ref_payload(base.refs[trial.ref]),
+                "resolved_model_refs": list(execution.resolved_model_refs),
+                "backtest_request_ref": execution.backtest_request_ref,
+            },
+        )
+        base.trial_specs[trial.ref] = ref
+
+
+def _recover_model_publications(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+) -> tuple[FeatureDatasetManifest | None, ModelBuildEvidence | None]:
+    actual_to_core = {
+        _wire(_ref_payload(ref)): local_ref for local_ref, ref in base.refs.items()
+    }
+    feature_manifest: FeatureDatasetManifest | None = None
+    model_evidence: ModelBuildEvidence | None = None
+    plan_ref = base.inputs.experiment_spec.model_build_plan
+    if type(plan_ref) is not str:
+        raise ResearchCoreError("MODEL_BUILD_PLAN_INVALID")
+    plan_wire = _wire(_ref_payload(base.refs[plan_ref]))
+    trial_ref_by_wire = {
+        _wire(_ref_payload(base.refs[trial.ref])): trial.ref for trial in base.trials
+    }
+    for _, ref, payload in _published_entries(foundation, _RESEARCH_ARTIFACTS_LOG):
+        if ref.artifact_type == "backtest_trial_spec":
+            trial_ref = trial_ref_by_wire.get(_wire(payload.get("trial_declaration_ref")))
+            if trial_ref is not None:
+                existing = base.trial_specs.get(trial_ref)
+                if existing is not None and existing != ref:
+                    raise ResearchCoreError("MODEL_BINDING_INVALID")
+                base.trial_specs[trial_ref] = ref
+            continue
+        if ref.artifact_type not in {
+            "feature_dataset_manifest",
+            "model_build_evidence",
+        }:
+            continue
+        if _wire(payload.get("model_build_plan_ref")) != plan_wire:
+            continue
+        converted = _reverse(payload, actual_to_core)
+        if type(converted) is not dict:
+            raise ResearchCoreError("MODEL_BINDING_INVALID")
+        if ref.artifact_type == "feature_dataset_manifest":
+            value = FeatureDatasetManifest(
+                converted["model_build_plan_ref"],
+                converted["dataset_revision"],
+                converted["interval_start"],
+                converted["interval_end"],
+                converted["feature_schema_hash"],
+                converted["training_data_hash"],
+                converted["row_count"],
+            )
+            if value.model_build_plan_ref != base.inputs.experiment_spec.model_build_plan:
+                continue
+            if feature_manifest is not None and feature_manifest != value:
+                raise ResearchCoreError("MODEL_BINDING_INVALID")
+            feature_manifest = value
+        else:
+            value = ModelBuildEvidence(
+                converted["model_build_plan_ref"],
+                converted["feature_dataset_manifest_ref"],
+                converted["model_artifact"],
+            )
+            if value.model_build_plan_ref != base.inputs.experiment_spec.model_build_plan:
+                continue
+            if model_evidence is not None and model_evidence != value:
+                raise ResearchCoreError("MODEL_BINDING_INVALID")
+            model_evidence = value
+            base.model_build_evidence_ref = ref
+        actual_to_core[_wire(_ref_payload(ref))] = value.ref
+        base.refs[value.ref] = ref
+    return feature_manifest, model_evidence
+
+
+def _reserve_slice(
     ledger: SampleConsumptionLedger,
     producer_ref: ArtifactRef,
-    trial: TrialDeclaration,
+    data_slice: DataSlice,
     purpose: str,
     reservation_at: str,
 ) -> None:
-    data_slice = trial.data_slice
     ledger.reserve(
         SampleConsumptionRecord(
             data_slice.dataset_revision,
@@ -408,6 +593,18 @@ def _reserve(
             reservation_at,
         ),
         producer_ref,
+    )
+
+
+def _reserve(
+    ledger: SampleConsumptionLedger,
+    producer_ref: ArtifactRef,
+    trial: TrialDeclaration,
+    purpose: str,
+    reservation_at: str,
+) -> None:
+    _reserve_slice(
+        ledger, producer_ref, trial.data_slice, purpose, reservation_at
     )
 
 
@@ -623,7 +820,7 @@ def _candidate_payload(
     trial_ref = selected.trial_declaration_ref
     if type(trial_ref) is not str or trial_ref not in base.refs or trial_ref not in base.trial_specs:
         raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
-    return {
+    payload = {
         "candidate_family_ref": _ref_payload(family_ref),
         "selection_declaration_ref": _ref_payload(base.selection_ref),
         "selected_trial_declaration_ref": _ref_payload(base.refs[trial_ref]),
@@ -633,6 +830,11 @@ def _candidate_payload(
         "selection_rank": selected.selection_rank,
         "validated": False,
     }
+    if base.model_build_evidence_ref is not None:
+        payload["model_build_evidence_ref"] = _ref_payload(
+            base.model_build_evidence_ref
+        )
+    return payload
 
 
 def _select_and_publish(
@@ -666,8 +868,9 @@ def _select_and_publish(
         )
 
     payload = _candidate_payload(base, family_ref, selected)
+    candidate_version = 2 if base.model_build_evidence_ref is not None else 1
     expected = ArtifactRef.from_envelope(
-        ArtifactEnvelope.create("strategy_candidate", 1, payload)
+        ArtifactEnvelope.create("strategy_candidate", candidate_version, payload)
     )
     if len(candidates) > 1 or (candidates and candidates[0][1] != payload):
         raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
@@ -677,7 +880,11 @@ def _select_and_publish(
             raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
     else:
         candidate_ref, _ = _publish(
-            foundation, _RESEARCH_ARTIFACTS_LOG, "strategy_candidate", payload
+            foundation,
+            _RESEARCH_ARTIFACTS_LOG,
+            "strategy_candidate",
+            payload,
+            schema_version=candidate_version,
         )
     return PublishedStrategyCandidate(
         candidate_ref, family_ref, manifest_ref, manifest_cutoff
@@ -1061,17 +1268,42 @@ def _execute_new(
     backtest: object,
 ) -> PublishedStrategyCandidate | PublishedNoSelection:
     executions = {
-        item.trial_declaration_ref: item for item in base.inputs.trial_executions
+        item.trial_declaration_ref: item
+        for item in getattr(base.inputs, "trial_executions", ())
     }
     recovery = _recover_execution(base, foundation)
     _close_persisted_outcomes(base, foundation, recovery)
     completed_records: dict[str, Mapping[str, object]] = {}
+    training_outcome = next(
+        (
+            recovery.outcomes[task]
+            for task in base.universe
+            if task.kind == "MODEL_TRAINING" and task in recovery.outcomes
+        ),
+        None,
+    )
 
     for trial in base.trials:
         task = base.trial_tasks[trial.ref]
         if task in recovery.outcomes:
             continue
-        execution = executions[trial.ref]
+        if training_outcome is not None and training_outcome.state != "COMPLETED":
+            started = _resume_attempt(base, foundation, recovery, task)
+            _append_recovered_terminal(
+                base,
+                foundation,
+                recovery,
+                started,
+                TaskOutcome(
+                    task,
+                    "BLOCKED",
+                    UpstreamTaskOutcome(training_outcome.ref),
+                ),
+            )
+            continue
+        execution = executions.get(trial.ref)
+        if execution is None:
+            raise ResearchCoreError("MODEL_BINDING_INVALID")
         while True:
             started = _resume_attempt(base, foundation, recovery, task)
             try:
@@ -1204,6 +1436,264 @@ def _execute_new(
     )
 
 
+def _publish_model_base(
+    inputs: FrozenModelExperimentInputs,
+    foundation: LocalFoundation,
+) -> tuple[_PublishedBase, FeatureDatasetManifest | None, ModelBuildEvidence | None]:
+    refs: dict[str, ArtifactRef] = {}
+    feature_ref, _ = _publish(
+        foundation,
+        _RESEARCH_ARTIFACTS_LOG,
+        "feature_recipe",
+        inputs.feature_recipe.payload,
+    )
+    refs[inputs.feature_recipe.ref] = feature_ref
+    trainer_ref, _ = _publish(
+        foundation,
+        _RESEARCH_ARTIFACTS_LOG,
+        "trainer_recipe",
+        inputs.trainer_recipe.payload,
+    )
+    refs[inputs.trainer_recipe.ref] = trainer_ref
+    plan_ref, _ = _publish(
+        foundation,
+        _RESEARCH_ARTIFACTS_LOG,
+        "model_build_plan",
+        _translate(inputs.model_build_plan.payload, refs),
+    )
+    refs[inputs.model_build_plan.ref] = plan_ref
+    base = _publish_base(
+        inputs,
+        foundation,
+        initial_refs=refs,
+        publish_trial_specs=False,
+    )
+    feature_manifest, model_evidence = _recover_model_publications(base, foundation)
+    return base, feature_manifest, model_evidence
+
+
+def _execute_model_build(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+    ledger: SampleConsumptionLedger,
+    builder: object,
+    feature_manifest: FeatureDatasetManifest | None,
+    model_evidence: ModelBuildEvidence | None,
+) -> ModelBuildEvidence | None:
+    if type(base.inputs) is not FrozenModelExperimentInputs:
+        raise TypeError("model build requires FrozenModelExperimentInputs")
+    inputs = base.inputs
+    recovery = _recover_execution(base, foundation)
+    _close_persisted_outcomes(base, foundation, recovery)
+    feature_task = next(task for task in base.universe if task.kind == "FEATURE_BUILD")
+    training_task = next(task for task in base.universe if task.kind == "MODEL_TRAINING")
+
+    if feature_task not in recovery.outcomes:
+        while True:
+            started = _resume_attempt(base, foundation, recovery, feature_task)
+            try:
+                _reserve_slice(
+                    ledger,
+                    base.refs[feature_task.task_artifact_ref],
+                    inputs.model_build_plan.training_slice,
+                    "feature_build",
+                    inputs.reservation_at,
+                )
+            except Exception:  # noqa: BLE001 - reservation failure blocks the read
+                outcome = TaskOutcome(
+                    feature_task,
+                    "BLOCKED",
+                    DependencyBlock("SAMPLE_RESERVATION_FAILED"),
+                )
+            else:
+                try:
+                    candidate = builder.build_features(inputs.model_build_plan)
+                    if type(candidate) is not FeatureDatasetManifest or not (
+                        candidate.model_build_plan_ref == inputs.model_build_plan.ref
+                        and candidate.dataset_revision
+                        == inputs.model_build_plan.training_slice.dataset_revision
+                        and candidate.interval_start
+                        == inputs.model_build_plan.training_slice.interval_start
+                        and candidate.interval_end
+                        == inputs.model_build_plan.training_slice.interval_end
+                        and candidate.feature_schema_hash
+                        == inputs.feature_recipe.feature_schema_hash
+                    ):
+                        raise ResearchCoreError("MODEL_BINDING_INVALID")
+                    feature_manifest = candidate
+                    ref, _ = _publish(
+                        foundation,
+                        _RESEARCH_ARTIFACTS_LOG,
+                        "feature_dataset_manifest",
+                        _translate(candidate.payload, base.refs),
+                    )
+                    base.refs[candidate.ref] = ref
+                    outcome = TaskOutcome(
+                        feature_task,
+                        "COMPLETED",
+                        FeatureDatasetPublication(candidate.ref),
+                    )
+                except Exception as error:  # noqa: BLE001 - builder boundary
+                    if started.ordinal < inputs.max_attempts:
+                        _append_retryable_close(
+                            base,
+                            foundation,
+                            recovery,
+                            started,
+                            _failure_code(error),
+                        )
+                        continue
+                    outcome = TaskOutcome(
+                        feature_task, "FAILED", LocalFailure(_failure_code(error))
+                    )
+            _append_recovered_terminal(
+                base, foundation, recovery, started, outcome
+            )
+            break
+
+    feature_outcome = recovery.outcomes[feature_task]
+    if training_task not in recovery.outcomes:
+        started = _resume_attempt(base, foundation, recovery, training_task)
+        if feature_outcome.state != "COMPLETED":
+            outcome = TaskOutcome(
+                training_task,
+                "BLOCKED",
+                UpstreamTaskOutcome(feature_outcome.ref),
+            )
+            _append_recovered_terminal(
+                base, foundation, recovery, started, outcome
+            )
+        else:
+            if feature_manifest is None:
+                raise ResearchCoreError("MODEL_BINDING_INVALID")
+            try:
+                _reserve_slice(
+                    ledger,
+                    base.refs[training_task.task_artifact_ref],
+                    inputs.model_build_plan.training_slice,
+                    "model_training",
+                    inputs.reservation_at,
+                )
+            except Exception:  # noqa: BLE001 - reservation failure blocks the read
+                outcome = TaskOutcome(
+                    training_task,
+                    "BLOCKED",
+                    DependencyBlock("SAMPLE_RESERVATION_FAILED"),
+                )
+                _append_recovered_terminal(
+                    base, foundation, recovery, started, outcome
+                )
+            else:
+                while True:
+                    try:
+                        artifact = builder.train_model(
+                            inputs.model_build_plan, feature_manifest
+                        )
+                        model_evidence = validate_model_build(
+                            inputs.model_build_plan,
+                            inputs.feature_recipe,
+                            inputs.trainer_recipe,
+                            feature_manifest,
+                            artifact,
+                        )
+                        ref, _ = _publish(
+                            foundation,
+                            _RESEARCH_ARTIFACTS_LOG,
+                            "model_build_evidence",
+                            _translate(model_evidence.payload, base.refs),
+                        )
+                        base.refs[model_evidence.ref] = ref
+                        base.model_build_evidence_ref = ref
+                        outcome = TaskOutcome(
+                            training_task,
+                            "COMPLETED",
+                            ModelBuildPublication(model_evidence.ref),
+                        )
+                    except Exception as error:  # noqa: BLE001 - builder boundary
+                        if started.ordinal < inputs.max_attempts:
+                            _append_retryable_close(
+                                base,
+                                foundation,
+                                recovery,
+                                started,
+                                _failure_code(error),
+                            )
+                            started = _resume_attempt(
+                                base, foundation, recovery, training_task
+                            )
+                            continue
+                        outcome = TaskOutcome(
+                            training_task,
+                            "FAILED",
+                            LocalFailure(_failure_code(error)),
+                        )
+                    _append_recovered_terminal(
+                        base, foundation, recovery, started, outcome
+                    )
+                    break
+
+    training_outcome = recovery.outcomes[training_task]
+    if training_outcome.state != "COMPLETED":
+        return None
+    if model_evidence is None:
+        raise ResearchCoreError("MODEL_BINDING_INVALID")
+    return model_evidence
+
+
+def execute_model_experiment(
+    frozen_inputs: FrozenModelExperimentInputs,
+    foundation: LocalFoundation,
+    sample_ledger: SampleConsumptionLedger,
+    builder: object,
+    backtest: object,
+) -> PublishedStrategyCandidate | PublishedNoSelection:
+    """Publish one immutable model build and its exact model-bound Experiment."""
+
+    inputs = _normal_model_inputs(frozen_inputs)
+    if type(foundation) is not LocalFoundation:
+        raise TypeError("foundation must be a LocalFoundation")
+    if type(sample_ledger) is not SampleConsumptionLedger:
+        raise TypeError("sample_ledger must be a SampleConsumptionLedger")
+    _require_model_builder(builder)
+    _require_model_backtest(backtest)
+    base, feature_manifest, model_evidence = _publish_model_base(inputs, foundation)
+    existing = _replay_existing(base, foundation, sample_ledger, backtest)
+    if existing is not None:
+        return existing
+    model_evidence = _execute_model_build(
+        base,
+        foundation,
+        sample_ledger,
+        builder,
+        feature_manifest,
+        model_evidence,
+    )
+    if model_evidence is not None:
+        executions = backtest.prepare_trials(base.trials, model_evidence)
+        if type(executions) is not tuple or any(
+            type(item) is not TrialExecution for item in executions
+        ):
+            raise TypeError("prepare_trials must return tuple[TrialExecution, ...]")
+        expected_model = _wire(model_evidence.model_artifact)
+        if any(
+            len(item.resolved_model_refs) != 1
+            or _wire(item.resolved_model_refs[0]) != expected_model
+            for item in executions
+        ):
+            raise ResearchCoreError("MODEL_BINDING_INVALID")
+        normal = FrozenExperimentInputs(
+            inputs.experiment_spec,
+            inputs.selection_policy,
+            inputs.selection_declared_by_ref,
+            executions,
+            inputs.reservation_at,
+            inputs.max_attempts,
+        )
+        base.inputs = normal
+        _publish_trial_specs(base, foundation, executions)
+    return _execute_new(base, foundation, sample_ledger, backtest)
+
+
 def execute_experiment(
     frozen_inputs: FrozenExperimentInputs,
     foundation: LocalFoundation,
@@ -1227,8 +1717,10 @@ def execute_experiment(
 
 __all__ = [
     "FrozenExperimentInputs",
+    "FrozenModelExperimentInputs",
     "PublishedNoSelection",
     "PublishedStrategyCandidate",
     "TrialExecution",
     "execute_experiment",
+    "execute_model_experiment",
 ]

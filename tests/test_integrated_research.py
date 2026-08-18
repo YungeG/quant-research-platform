@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -12,14 +13,24 @@ from crypto_quant_domain import (
     ArtifactIntegrityError,
     ArtifactRef,
     ArtifactRetentionUnavailableError,
+    SimulationInstant,
+    SourceSequence,
+    TimelinePhase,
+    UtcInstant,
     canonical_bytes,
 )
 from crypto_quant_foundation import LocalFoundation
 from crypto_quant_research import (
+    FeatureDatasetManifest,
+    FeatureRecipe,
     FrozenExperimentInputs,
+    FrozenModelExperimentInputs,
+    ModelBuildPlan,
     PublishedStrategyCandidate,
+    TrainerRecipe,
     TrialExecution,
     execute_experiment,
+    execute_model_experiment,
 )
 from crypto_quant_research.integration import (
     DataSlice,
@@ -266,6 +277,317 @@ def _runtime(
             repository_failure=repository_failure,
         ),
         inputs,
+    )
+
+
+def _content_hash(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+class _FixtureModelBuilder:
+    def __init__(
+        self,
+        foundation: LocalFoundation,
+        feature_manifest: FeatureDatasetManifest,
+        model_artifact: backtest.ModelArtifactRef,
+        *,
+        fail_feature: bool = False,
+        fail_training_once: bool = False,
+    ) -> None:
+        self.foundation = foundation
+        self.feature_manifest = feature_manifest
+        self.model_artifact = model_artifact
+        self.fail_feature = fail_feature
+        self.fail_training_once = fail_training_once
+        self.feature_calls = 0
+        self.training_calls = 0
+        self.reservations_before_read: list[int] = []
+
+    def build_features(self, plan: ModelBuildPlan) -> FeatureDatasetManifest:
+        self.feature_calls += 1
+        self.reservations_before_read.append(
+            len(self.foundation.entries(_SAMPLE_LOG))
+        )
+        if self.fail_feature:
+            raise RuntimeError("fixture feature build failed")
+        assert plan.ref == self.feature_manifest.model_build_plan_ref
+        return self.feature_manifest
+
+    def train_model(
+        self, plan: ModelBuildPlan, feature_manifest: FeatureDatasetManifest
+    ) -> dict[str, object]:
+        self.training_calls += 1
+        self.reservations_before_read.append(
+            len(self.foundation.entries(_SAMPLE_LOG))
+        )
+        assert plan.ref == feature_manifest.model_build_plan_ref
+        if self.fail_training_once and self.training_calls == 1:
+            raise RuntimeError("fixture transient training failure")
+        return self.model_artifact.to_canonical_dict()
+
+
+class _ModelBacktestOperations(_PublicBacktestOperations):
+    def __init__(
+        self,
+        foundation: LocalFoundation,
+        publication_root: Path,
+        timeline: backtest.ModelRevisionTimeline,
+    ) -> None:
+        super().__init__(foundation, {})
+        self._publication_root = publication_root
+        self._timeline = timeline
+        self.prepare_calls = 0
+        self.reservations_before_prepare: list[int] = []
+        self.outcomes_before_prepare: list[int] = []
+        self.prepared_bindings: list[backtest.ModelRequestBinding] = []
+
+    def prepare_trials(self, trials, evidence) -> tuple[TrialExecution, ...]:
+        self.reservations_before_prepare.append(
+            len(self._foundation.entries(_SAMPLE_LOG))
+        )
+        self.outcomes_before_prepare.append(len(_outcome_payloads(self._foundation)))
+        executions: list[TrialExecution] = []
+        for index, trial in enumerate(trials):
+            prepared = backtest.prepare_model_bound_cash_development_backtest(
+                request_intent=_BINDING_MODULE._intent(f"research:{trial.ref}"),
+                provider_inputs=_BINDING_MODULE._provider_inputs(market=index < 3),
+                model_timeline=self._timeline,
+                expected_model_key=evidence.model_artifact["model_key"],
+                expected_artifact_ref_hash=evidence.model_artifact[
+                    "artifact_ref_hash"
+                ],
+                artifact_reader=self._foundation,
+                artifact_publisher=self._foundation,
+                market_reader=_BINDING_MODULE._market_reader(),
+                publication_root=self._publication_root,
+            )
+            self.prepare_calls += 1
+            self.prepared_bindings.append(prepared.model_binding)
+            self._prepared[trial.ref] = prepared
+            executions.append(
+                TrialExecution(
+                    trial.ref,
+                    {"binding_key": trial.ref},
+                    _plain(prepared.request_ref),
+                    (evidence.model_artifact,),
+                )
+            )
+        return tuple(executions)
+
+
+def _model_runtime(
+    tmp_path: Path,
+    *,
+    fail_feature: bool = False,
+    fail_training_once: bool = False,
+    max_attempts: int = 1,
+):
+    foundation = LocalFoundation(tmp_path / "foundation", clock=lambda: _RECEIVED_AT)
+    profile_ref = backtest.BacktestAnalysisRuntime(foundation).publish_metric_profile()
+    training_slice = DataSlice(
+        {
+            "type": "backtest_market_bundle_ref",
+            "artifact_ref": _artifact_ref("backtest_market_bundle", "6"),
+        },
+        "model-training-v1",
+        "1970-01-01T00:00:00.000000Z",
+        "1970-01-01T00:00:00.000001Z",
+    )
+    feature = FeatureRecipe(
+        "returns-v1",
+        _content_hash("feature-code"),
+        _content_hash("feature-schema"),
+        ("close",),
+    )
+    trainer = TrainerRecipe(
+        "linear-v1",
+        _content_hash("training-code"),
+        "alpha.primary",
+        {"ridge": "0.1"},
+    )
+    plan = ModelBuildPlan(feature.ref, trainer.ref, training_slice, 7)
+    spec = ExperimentSpec(
+        hypothesis_ref=_artifact_ref("hypothesis", "1"),
+        strategy_definition_ref=_artifact_ref("strategy_definition", "2"),
+        data_slices=(training_slice,),
+        parameter_combinations=(
+            ParameterCombination((("lookback", "10"),)),
+            ParameterCombination((("lookback", "20"),)),
+        ),
+        seeds=(1, 2),
+        scenario_refs=(_artifact_ref("scenario", "4"),),
+        backtest_template_ref=_artifact_ref("backtest_template", "5"),
+        model_build_plan=plan,
+        metric_profile_refs=(_plain(profile_ref),),
+        budget={"max_trials": 4},
+    )
+    manifest = FeatureDatasetManifest(
+        plan.ref,
+        training_slice.dataset_revision,
+        training_slice.interval_start,
+        training_slice.interval_end,
+        feature.feature_schema_hash,
+        _content_hash("training-data"),
+        100,
+    )
+    artifact = backtest.ModelArtifactRef(
+        model_key=trainer.model_key,
+        model_hash=_content_hash("model-artifact"),
+        training_data_hash=manifest.training_data_hash,
+        training_start=UtcInstant(0),
+        training_end=UtcInstant(1_000),
+        training_code_hash=trainer.training_code_hash,
+        feature_schema_hash=feature.feature_schema_hash,
+        available_at=SimulationInstant(
+            UtcInstant(1_000),
+            TimelinePhase(70, "model_availability"),
+            SourceSequence(1),
+        ),
+        revision_id="genesis",
+        supersedes_revision_id=None,
+    )
+    timeline = backtest.ModelRevisionTimeline(
+        model_key=artifact.model_key,
+        decision_instant=SimulationInstant(
+            UtcInstant(1_000),
+            TimelinePhase(70, "model_availability"),
+            SourceSequence(2),
+        ),
+        artifacts=(artifact,),
+    )
+    inputs = FrozenModelExperimentInputs(
+        spec,
+        feature,
+        trainer,
+        plan,
+        _policy(spec),
+        {"type": "actor_ref", "actor_id": "research"},
+        _RESERVED_AT,
+        max_attempts,
+    )
+    return (
+        foundation,
+        SampleConsumptionLedger(foundation),
+        _FixtureModelBuilder(
+            foundation,
+            manifest,
+            artifact,
+            fail_feature=fail_feature,
+            fail_training_once=fail_training_once,
+        ),
+        _ModelBacktestOperations(
+            foundation,
+            tmp_path / "publications",
+            timeline,
+        ),
+        inputs,
+        artifact,
+    )
+
+
+def test_real_model_research_golden_replays_exact_ten_task_candidate(
+    tmp_path: Path,
+) -> None:
+    foundation, ledger, builder, provider, inputs, artifact = _model_runtime(tmp_path)
+
+    first = execute_model_experiment(inputs, foundation, ledger, builder, provider)
+    second = execute_model_experiment(inputs, foundation, ledger, builder, provider)
+
+    assert type(first) is PublishedStrategyCandidate
+    assert second == first
+    assert builder.feature_calls == 1
+    assert builder.training_calls == 1
+    assert builder.reservations_before_read == [1, 2]
+    assert provider.prepare_calls == 4
+    assert provider.reservations_before_prepare == [2]
+    assert provider.outcomes_before_prepare == [2]
+    assert provider.run_calls == 4
+    assert provider.derive_calls == 3
+    assert all(
+        binding.artifact_ref_hash == artifact.artifact_ref_hash
+        for binding in provider.prepared_bindings
+    )
+    outcomes = _outcome_payloads(foundation)
+    assert len(outcomes) == 10
+    assert [item["state"] for item in outcomes].count("COMPLETED") == 8
+    assert [item["state"] for item in outcomes].count("BLOCKED") == 2
+    purposes = [
+        json.loads(entry.payload)["payload"]["record"]["purpose"]
+        for entry in foundation.entries(_SAMPLE_LOG)
+    ]
+    assert purposes[:2] == ["feature_build", "model_training"]
+    candidates = [
+        json.loads(entry.payload)
+        for entry in foundation.entries("research.artifacts.v1")
+        if json.loads(entry.payload)["artifact_type"] == "strategy_candidate"
+    ]
+    assert len(candidates) == 1
+    assert candidates[0]["schema_version"] == 2
+    assert "model_build_evidence_ref" in candidates[0]["payload"]
+
+
+def test_transient_model_training_failure_retries_without_duplicate_reservations(
+    tmp_path: Path,
+) -> None:
+    foundation, ledger, builder, provider, inputs, _ = _model_runtime(
+        tmp_path,
+        fail_training_once=True,
+        max_attempts=2,
+    )
+
+    result = execute_model_experiment(inputs, foundation, ledger, builder, provider)
+
+    assert type(result) is PublishedStrategyCandidate
+    assert builder.feature_calls == 1
+    assert builder.training_calls == 2
+    assert builder.reservations_before_read == [1, 2, 2]
+    assert len(foundation.entries(_SAMPLE_LOG)) == 7
+    assert provider.prepare_calls == 4
+
+
+def test_feature_build_failure_blocks_training_and_all_trials(
+    tmp_path: Path,
+) -> None:
+    foundation, ledger, builder, provider, inputs, _ = _model_runtime(
+        tmp_path, fail_feature=True
+    )
+
+    result = execute_model_experiment(inputs, foundation, ledger, builder, provider)
+
+    assert type(result).__name__ == "PublishedNoSelection"
+    assert builder.feature_calls == 1
+    assert builder.training_calls == 0
+    assert provider.prepare_calls == 0
+    assert provider.run_calls == 0
+    outcomes = _outcome_payloads(foundation)
+    assert len(outcomes) == 10
+    assert [item["state"] for item in outcomes].count("FAILED") == 1
+    assert [item["state"] for item in outcomes].count("BLOCKED") == 9
+
+
+def test_feature_reservation_failure_blocks_every_model_consumer(
+    tmp_path: Path,
+) -> None:
+    foundation, ledger, builder, provider, inputs, _ = _model_runtime(tmp_path)
+    reserve = ledger.reserve
+
+    def fail_feature_reservation(record, producer_ref):
+        if record.purpose == "feature_build":
+            raise RuntimeError("injected reservation failure")
+        return reserve(record, producer_ref)
+
+    ledger.reserve = fail_feature_reservation  # type: ignore[method-assign]
+    result = execute_model_experiment(inputs, foundation, ledger, builder, provider)
+
+    assert type(result).__name__ == "PublishedNoSelection"
+    assert builder.feature_calls == 0
+    assert builder.training_calls == 0
+    assert provider.prepare_calls == 0
+    outcomes = _outcome_payloads(foundation)
+    assert len(outcomes) == 10
+    assert [item["state"] for item in outcomes].count("BLOCKED") == 10
+    assert outcomes[0]["witness"]["dependency_block"]["reason_code"] == (
+        "SAMPLE_RESERVATION_FAILED"
     )
 
 

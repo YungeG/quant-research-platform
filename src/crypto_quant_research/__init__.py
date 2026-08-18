@@ -22,10 +22,12 @@ from .integration import (
 _RUNTIME_EXPORTS = frozenset(
     {
         "FrozenExperimentInputs",
+        "FrozenModelExperimentInputs",
         "PublishedNoSelection",
         "PublishedStrategyCandidate",
         "TrialExecution",
         "execute_experiment",
+        "execute_model_experiment",
     }
 )
 
@@ -43,6 +45,7 @@ __all__ = [
     "FeatureDatasetManifest",
     "FeatureRecipe",
     "FrozenExperimentInputs",
+    "FrozenModelExperimentInputs",
     "ModelBuildEvidence",
     "ModelBuildPlan",
     "ModelTrainingTask",
@@ -55,5 +58,6 @@ __all__ = [
     "TrialExecution",
     "compile_trial_declarations",
     "execute_experiment",
+    "execute_model_experiment",
     "validate_model_build",
 ]

@@ -396,12 +396,14 @@ def test_public_surface_adds_values_without_model_runtime_abi() -> None:
     for name in (
         "DataSlice",
         "FeatureRecipe",
+        "FrozenModelExperimentInputs",
         "TrainerRecipe",
         "ModelBuildPlan",
         "FeatureBuildTask",
         "ModelTrainingTask",
         "FeatureDatasetManifest",
         "ModelBuildEvidence",
+        "execute_model_experiment",
         "validate_model_build",
     ):
         assert getattr(public, name) is not None
@@ -423,3 +425,20 @@ def test_public_surface_adds_values_without_model_runtime_abi() -> None:
         "model_registry",
     ):
         assert forbidden not in source
+
+    runtime_source = (
+        Path(__file__).resolve().parents[1]
+        / "src/crypto_quant_research/runtime.py"
+    ).read_text(encoding="utf-8")
+    for forbidden in (
+        "Protocol",
+        "Callable",
+        "model_registry",
+        "load_model",
+        "pickle",
+        "joblib",
+        "torch",
+        "tensorflow",
+        "sklearn",
+    ):
+        assert forbidden not in runtime_source
