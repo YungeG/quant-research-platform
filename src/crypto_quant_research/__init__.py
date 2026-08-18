@@ -7,6 +7,16 @@ from .declarations import (
     TrialDeclaration,
     compile_trial_declarations,
 )
+from .integration import (
+    FeatureBuildTask,
+    FeatureDatasetManifest,
+    FeatureRecipe,
+    ModelBuildEvidence,
+    ModelBuildPlan,
+    ModelTrainingTask,
+    TrainerRecipe,
+    validate_model_build,
+)
 
 _RUNTIME_EXPORTS = frozenset(
     {
@@ -27,13 +37,21 @@ def __getattr__(name: str):
 
 __all__ = [
     "CampaignScope",
+    "FeatureBuildTask",
+    "FeatureDatasetManifest",
+    "FeatureRecipe",
     "FrozenExperimentInputs",
+    "ModelBuildEvidence",
+    "ModelBuildPlan",
+    "ModelTrainingTask",
     "ParameterCombination",
     "PublishedNoSelection",
     "PublishedStrategyCandidate",
     "SelectionPolicy",
+    "TrainerRecipe",
     "TrialDeclaration",
     "TrialExecution",
     "compile_trial_declarations",
     "execute_experiment",
+    "validate_model_build",
 ]
