@@ -414,7 +414,10 @@ def _publish_base(
     refs: dict[str, ArtifactRef] = dict(initial_refs or {})
 
     experiment_ref, _ = _publish(
-        foundation, _RESEARCH_ARTIFACTS_LOG, "experiment_spec", spec.payload
+        foundation,
+        _RESEARCH_ARTIFACTS_LOG,
+        "experiment_spec",
+        _translate(spec.payload, refs),
     )
     refs[spec.ref] = experiment_ref
 
