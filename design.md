@@ -1,13 +1,13 @@
 # Research Platform 模块设计
 
 - **实现状态：** 以 [Roadmap status registry](../implementation/roadmap.md#2-status-registry) 为唯一权威；本文不维护节点状态
-- **版本：** 0.3
-- **集成权威：** [Integration v1 §4、§7、§9](../overall/integration-v1.md#4-research-integration-rp-thin-02)
-- **实现计划：** [Research](../implementation/plans/research.md)
+- **版本：** 0.4
+- **集成权威：** [Integration v1 §4、§7、§9](../overall/integration-v1.md#4-research-integration-rp-thin-02)；[Integration v2](../overall/integration-v2.md)
+- **实现计划：** [Research v1](../implementation/plans/research.md)；[v2 model build](../implementation/plans/v2-research-model-build.md)
 - **上游：** Research author、immutable MarketBundle、Backtest public root
 - **下游：** Strategy Validation
 
-Research owns what was declared, attempted, and selected. It does not own Backtest economics, Validation conclusions, or Promotion.
+Research owns what was declared, built, attempted, and selected. It does not own Backtest model visibility/economics, Validation conclusions, or Promotion.
 
 ## 1. Boundary
 
@@ -48,8 +48,8 @@ Research is a Validation record producer, not a sample-semantic owner. Each Tria
 
 Research receives `BacktestFacade` and `CanonicalEvidenceRepository` directly from the Backtest public root. Backtest alone verifies canonical bytes, manifests, retention, and hash chains; Research checks only its own semantic/link eligibility. Consumers branch before analysis; only `CompletedPublication.publication_ref` reaches `derive()`.
 
-## 4. Acceptance and deferral
+## 4. Integration v2 model-build extension
 
-`RP-THIN-02` acceptance requires canonical finite axes; the four-trial/eight-task golden; exact TaskOutcome cover at the manifest publication cutoff; the two-field CandidateFamily; retained blocked TrialDeclaration; predeclared selection; correct public Backtest links; and forged-link rejection.
+V2 activates the reserved `model_build_plan` axis with exactly one FeatureRecipe, one TrainerRecipe, one FeatureBuild task, and one ModelTraining task. A non-null Experiment has ten exact-cover tasks; null-plan v1 identity remains unchanged. Research publishes FeatureDatasetManifest and ModelBuildEvidence, then binds that evidence into each Trial without duplicating Backtest `ModelArtifactRef`.
 
-Feature/model/trainer ABI, ModelBuild, range/adaptive search, cross-Experiment CandidateFamily, and additional research methods are outside v1.
+The complete additive contract and failure rules are in [Integration v2](../overall/integration-v2.md). Callable/plugin/framework ABI, model bytes/loading/inference, tuning/range/adaptive search, multiple model plans, cross-Experiment CandidateFamily, and additional research methods remain excluded.
