@@ -1558,11 +1558,15 @@ def map_backtest_observation(task_ref: TaskRef, observation: object) -> TaskOutc
         return TaskOutcome(task_ref, "FAILED", LocalFailure(code))
 
     keys = set(observation)
-    if keys == {
+    completed_fields = {
         "publication_ref",
         "semantic_run_id",
         "execution_result_hash",
         "result_grade",
+    }
+    if frozenset(keys) in {
+        frozenset(completed_fields),
+        frozenset(completed_fields | {"model_binding"}),
     }:
         if task_ref.kind != "TRIAL":
             _fail("TASK_OUTCOME_INVALID")

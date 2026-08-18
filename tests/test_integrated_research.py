@@ -182,12 +182,15 @@ class _PublicBacktestOperations:
     def load_completed(self, ref: object) -> dict[str, object]:
         nominal = self._nominal(ref)
         record = self._repository(nominal).load_completed(nominal)
-        return {
+        payload = {
             "publication_ref": _plain(record.source_publication_ref),
             "semantic_run_id": record.semantic_run_id,
             "execution_result_hash": record.source_execution_result_hash,
             "result_grade": record.result_grade.value,
         }
+        if record.engine_context.model_binding is not None:
+            payload["model_binding"] = _plain(record.engine_context.model_binding)
+        return payload
 
     def load_terminal(self, ref: object) -> dict[str, object]:
         nominal = self._nominal(ref)
