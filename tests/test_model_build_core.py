@@ -394,6 +394,7 @@ def test_ten_task_manifest_exact_cover_and_build_failure_propagation() -> None:
 
 def test_public_surface_adds_values_without_model_runtime_abi() -> None:
     for name in (
+        "DataSlice",
         "FeatureRecipe",
         "TrainerRecipe",
         "ModelBuildPlan",

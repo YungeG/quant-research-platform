@@ -8,6 +8,7 @@ from .declarations import (
     compile_trial_declarations,
 )
 from .integration import (
+    DataSlice,
     FeatureBuildTask,
     FeatureDatasetManifest,
     FeatureRecipe,
@@ -37,6 +38,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "CampaignScope",
+    "DataSlice",
     "FeatureBuildTask",
     "FeatureDatasetManifest",
     "FeatureRecipe",
