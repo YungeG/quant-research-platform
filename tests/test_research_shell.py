@@ -37,6 +37,7 @@ assert _PORT_SPEC is not None and _PORT_SPEC.loader is not None
 _PORT_MODULE = importlib.util.module_from_spec(_PORT_SPEC)
 _PORT_SPEC.loader.exec_module(_PORT_MODULE)
 InMemoryBacktestConsumerPort = _PORT_MODULE.InMemoryBacktestConsumerPort
+CONTRACT_V2_PATH = _PORT_MODULE.CONTRACT_V2_PATH
 load_contract_fixture = _PORT_MODULE.load_contract_fixture
 
 ARTIFACT_LOG = "research.artifacts.v1"
@@ -158,6 +159,27 @@ class RecordingPort(InMemoryBacktestConsumerPort):
         return super().derive(completed_ref, metric_profile_ref)
 
 
+class DecisionGradePort(RecordingPort):
+    def __init__(self, foundation: LocalFoundation) -> None:
+        super().__init__(foundation, load_contract_fixture(CONTRACT_V2_PATH))
+        self.completed_v3_calls: list[object] = []
+        self.analysis_v2_calls: list[object] = []
+
+    def load_completed(self, ref: dict[str, object]) -> dict[str, object]:
+        raise AssertionError("V2 completion must not use load_completed")
+
+    def load_analysis(self, ref: dict[str, object]) -> dict[str, object]:
+        raise AssertionError("V2 analysis must not use load_analysis")
+
+    def load_completed_v3(self, ref: dict[str, object]) -> dict[str, object]:
+        self.completed_v3_calls.append(deepcopy(ref))
+        return super().load_completed_v3(ref)
+
+    def load_analysis_v2(self, ref: dict[str, object]) -> dict[str, object]:
+        self.analysis_v2_calls.append(deepcopy(ref))
+        return super().load_analysis_v2(ref)
+
+
 def _inputs(
     *,
     terminal_case: str = "terminal_blocked",
@@ -189,6 +211,47 @@ def _inputs(
         executions,
         RESERVED_AT,
         max_attempts,
+    )
+
+
+def _decision_grade_inputs() -> FrozenExperimentInputs:
+    case = load_contract_fixture(CONTRACT_V2_PATH)["cases"][0]
+    profile = case["derive"]["metric_profile_ref"]
+    spec = ExperimentSpec(
+        hypothesis_ref=_artifact_ref("hypothesis", "6"),
+        strategy_definition_ref=_artifact_ref("strategy_definition", "7"),
+        data_slices=(
+            DataSlice(
+                _tagged_ref(
+                    "backtest_market_bundle_ref", "backtest_market_bundle", "8"
+                ),
+                "fixture-v2",
+                "2026-03-01T00:00:00.000000Z",
+                "2026-04-01T00:00:00.000000Z",
+            ),
+        ),
+        parameter_combinations=(ParameterCombination((("lookback", "10"),)),),
+        seeds=(1,),
+        scenario_refs=(_artifact_ref("scenario", "9"),),
+        backtest_template_ref=_artifact_ref("backtest_template", "a"),
+        model_build_plan=None,
+        metric_profile_refs=(profile,),
+        budget={"max_trials": 1},
+    )
+    trial = build_trial_declarations(spec)[0]
+    return FrozenExperimentInputs(
+        spec,
+        _policy(spec, grades=("decision_grade",)),
+        {"type": "actor_ref", "actor_id": "research"},
+        (
+            TrialExecution(
+                trial.ref,
+                {"fixture_case": "decision_grade_completed_v3"},
+                {"type": "backtest_request_ref", "id": "fixture-decision-grade"},
+            ),
+        ),
+        RESERVED_AT,
+        1,
     )
 
 
@@ -286,6 +349,72 @@ def test_fixture_shell_publishes_exact_closure_and_replays_without_a_second_run(
         len(foundation.entries(EXECUTION_LOG)),
         len(foundation.entries(SAMPLE_LOG)),
     )
+
+
+def test_decision_grade_shell_uses_exact_v2_dispatch_and_replays(
+    tmp_path: Path,
+) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DecisionGradePort(foundation)
+    inputs = _decision_grade_inputs()
+
+    result = execute_experiment(inputs, foundation, ledger, port)
+
+    assert type(result) is PublishedStrategyCandidate
+    case = load_contract_fixture(CONTRACT_V2_PATH)["cases"][0]
+    candidate = _payload(foundation, result.strategy_candidate_ref)
+    assert candidate["selected_publication_ref"] == case["completed_v3"][
+        "publication_ref"
+    ]
+    assert candidate["selected_analysis_ref"] == case["analysis_v2"]["analysis_ref"]
+    assert port.run_requests[0]["fixture_case"] == "decision_grade_completed_v3"
+    assert port.completed_v3_calls
+    assert port.analysis_v2_calls
+    assert len(port.run_requests) == len(port.derive_calls) == 1
+    assert [item["state"] for item in _outcomes(foundation)] == [
+        "COMPLETED",
+        "COMPLETED",
+    ]
+
+    before = (
+        len(port.run_requests),
+        len(port.derive_calls),
+        len(foundation.entries(ARTIFACT_LOG)),
+        len(foundation.entries(EXECUTION_LOG)),
+        len(foundation.entries(SAMPLE_LOG)),
+    )
+    replay = execute_experiment(inputs, foundation, ledger, port)
+    assert replay == result
+    assert before == (
+        len(port.run_requests),
+        len(port.derive_calls),
+        len(foundation.entries(ARTIFACT_LOG)),
+        len(foundation.entries(EXECUTION_LOG)),
+        len(foundation.entries(SAMPLE_LOG)),
+    )
+
+
+def test_decision_grade_v2_failure_never_falls_back_to_v1(tmp_path: Path) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DecisionGradePort(foundation)
+    case = load_contract_fixture(CONTRACT_V2_PATH)["cases"][0]
+    port.inject_failures(
+        case["completed_v3"]["publication_ref"],
+        "PORT_COMPLETED_VERSION_MISMATCH",
+    )
+
+    result = execute_experiment(_decision_grade_inputs(), foundation, ledger, port)
+
+    assert type(result) is PublishedNoSelection
+    outcomes = _outcomes(foundation)
+    assert outcomes[0]["state"] == "FAILED"
+    assert outcomes[0]["witness"] == {
+        "local_failure": {"failure_code": "PORT_COMPLETED_VERSION_MISMATCH"}
+    }
+    assert outcomes[1]["state"] == "BLOCKED"
+    assert port.derive_calls == []
 
 
 @pytest.mark.parametrize("interrupt_after", range(1, 26))

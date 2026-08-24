@@ -56,6 +56,20 @@ _LOCAL_REF = re.compile(
 _TASK_KINDS = {"FEATURE_BUILD", "MODEL_TRAINING", "TRIAL", "ANALYSIS"}
 _OUTCOME_STATES = {"COMPLETED", "BLOCKED", "FAILED", "CANCELLED"}
 _TERMINAL_STATES = {"BLOCKED", "FAILED", "CANCELLED"}
+_BACKTEST_REF_VARIANTS = {
+    "completed": {
+        "backtest_canonical_publication_ref": 1,
+        "backtest_canonical_publication_ref_v2": 2,
+    },
+    "analysis": {
+        "analysis_artifact_ref": 1,
+        "analysis_artifact_ref_v2": 2,
+    },
+}
+_BACKTEST_ARTIFACT_TYPES = {
+    "completed": "canonical_publication_manifest",
+    "analysis": "backtest_analysis",
+}
 
 
 class ResearchCoreError(ValueError):
@@ -120,6 +134,7 @@ def _canonical_ref(
     *,
     expected_type: str | None = None,
     expected_artifact_type: str | None = None,
+    expected_schema_versions: tuple[int, ...] = (1,),
 ) -> object:
     if expected_artifact_type in _LOCAL_REF_TYPES:
         if type(value) is not str:
@@ -168,9 +183,11 @@ def _canonical_ref(
             raise ValueError(f"{name} artifact_type must be nonempty")
         if (
             type(artifact.get("schema_version")) is not int
-            or artifact["schema_version"] != 1
+            or artifact["schema_version"] not in expected_schema_versions
         ):
-            raise ValueError(f"{name} schema_version must be 1")
+            raise ValueError(
+                f"{name} schema_version must be one of {expected_schema_versions}"
+            )
         content_hash = artifact.get("content_hash")
         if type(content_hash) is not str or _HASH.fullmatch(content_hash) is None:
             raise ValueError(f"{name} content_hash must be canonical")
@@ -183,6 +200,36 @@ def _canonical_ref(
     ):
         raise ValueError(f"{name} must address {expected_artifact_type}")
     return _freeze_json(plain)
+
+
+def _canonical_backtest_ref(value: object, name: str, kind: str) -> object:
+    try:
+        variants = _BACKTEST_REF_VARIANTS[kind]
+        artifact_type = _BACKTEST_ARTIFACT_TYPES[kind]
+    except KeyError as error:
+        raise ValueError("Backtest reference kind is not recognized") from error
+    normalized = _canonical_ref(
+        value,
+        name,
+        expected_artifact_type=artifact_type,
+        expected_schema_versions=tuple(variants.values()),
+    )
+    plain = _plain_json(normalized)
+    if type(plain) is not dict or type(plain.get("artifact_ref")) is not dict:
+        raise ValueError(f"{name} must use one exact nominal Backtest reference")
+    ref_type = plain.get("type")
+    schema_version = plain["artifact_ref"].get("schema_version")
+    if variants.get(ref_type) != schema_version:
+        raise ValueError(f"{name} nominal type and schema_version do not match")
+    return normalized
+
+
+def _backtest_ref_version(value: object, kind: str) -> int:
+    normalized = _canonical_backtest_ref(value, f"{kind}_ref", kind)
+    plain = _plain_json(normalized)
+    if type(plain) is not dict:
+        raise ValueError(f"{kind}_ref must be canonical")
+    return _BACKTEST_REF_VARIANTS[kind][plain["type"]]  # type: ignore[index]
 
 
 def _local_ref(artifact_type: str, payload: object) -> str:
@@ -1184,11 +1231,10 @@ class TrialCompletedPublication:
             object.__setattr__(
                 self,
                 "publication_ref",
-                _canonical_ref(
+                _canonical_backtest_ref(
                     self.publication_ref,
                     "publication_ref",
-                    expected_type="backtest_canonical_publication_ref",
-                    expected_artifact_type="canonical_publication_manifest",
+                    "completed",
                 ),
             )
         except ValueError as error:
@@ -1205,23 +1251,25 @@ class AnalysisDerivation:
             object.__setattr__(
                 self,
                 "analysis_ref",
-                _canonical_ref(
+                _canonical_backtest_ref(
                     self.analysis_ref,
                     "analysis_ref",
-                    expected_type="analysis_artifact_ref",
-                    expected_artifact_type="backtest_analysis",
+                    "analysis",
                 ),
             )
             object.__setattr__(
                 self,
                 "source_publication_ref",
-                _canonical_ref(
+                _canonical_backtest_ref(
                     self.source_publication_ref,
                     "source_publication_ref",
-                    expected_type="backtest_canonical_publication_ref",
-                    expected_artifact_type="canonical_publication_manifest",
+                    "completed",
                 ),
             )
+            if _backtest_ref_version(self.analysis_ref, "analysis") != (
+                _backtest_ref_version(self.source_publication_ref, "completed")
+            ):
+                raise ValueError("analysis and source publication versions must match")
         except ValueError as error:
             _fail("TASK_OUTCOME_INVALID", str(error))
 
@@ -1564,12 +1612,41 @@ def map_backtest_observation(task_ref: TaskRef, observation: object) -> TaskOutc
         "execution_result_hash",
         "result_grade",
     }
+    completed_v3_fields = completed_fields | {
+        "rebuild_verification_ref",
+        "proof_publication_manifest_ref",
+    }
     if frozenset(keys) in {
         frozenset(completed_fields),
         frozenset(completed_fields | {"model_binding"}),
+        frozenset(completed_v3_fields),
     }:
         if task_ref.kind != "TRIAL":
             _fail("TASK_OUTCOME_INVALID")
+        if keys == completed_v3_fields:
+            try:
+                if (
+                    _backtest_ref_version(observation["publication_ref"], "completed")
+                    != 2
+                    or observation["result_grade"] != "decision_grade"
+                ):
+                    raise ValueError("completed-v3 identity is invalid")
+                _canonical_ref(
+                    observation["rebuild_verification_ref"],
+                    "rebuild_verification_ref",
+                    expected_type="artifact_ref",
+                    expected_artifact_type="deterministic_rebuild_verification",
+                )
+                _canonical_ref(
+                    observation["proof_publication_manifest_ref"],
+                    "proof_publication_manifest_ref",
+                    expected_type="artifact_ref",
+                    expected_artifact_type=(
+                        "deterministic_rebuild_verification_publication_manifest"
+                    ),
+                )
+            except (KeyError, ValueError) as error:
+                _fail("TASK_OUTCOME_INVALID", str(error))
         return TaskOutcome(
             task_ref,
             "COMPLETED",
@@ -1976,23 +2053,25 @@ class VerifiedAnalysis:
             object.__setattr__(
                 self,
                 "analysis_ref",
-                _canonical_ref(
+                _canonical_backtest_ref(
                     self.analysis_ref,
                     "analysis_ref",
-                    expected_type="analysis_artifact_ref",
-                    expected_artifact_type="backtest_analysis",
+                    "analysis",
                 ),
             )
             object.__setattr__(
                 self,
                 "trial_publication_ref",
-                _canonical_ref(
+                _canonical_backtest_ref(
                     self.trial_publication_ref,
                     "trial_publication_ref",
-                    expected_type="backtest_canonical_publication_ref",
-                    expected_artifact_type="canonical_publication_manifest",
+                    "completed",
                 ),
             )
+            if _backtest_ref_version(self.analysis_ref, "analysis") != (
+                _backtest_ref_version(self.trial_publication_ref, "completed")
+            ):
+                raise ValueError("analysis and publication versions must match")
             object.__setattr__(
                 self,
                 "metric_profile_ref",

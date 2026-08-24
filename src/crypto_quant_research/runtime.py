@@ -45,6 +45,7 @@ from .integration import (
     TrialDeclaration,
     UpstreamTaskOutcome,
     VerifiedAnalysis,
+    _backtest_ref_version,
     block_analysis_from_upstream,
     build_candidate_family,
     build_execution_manifest,
@@ -167,6 +168,39 @@ def _require_backtest(backtest: object) -> None:
         for name in ("run", "derive", "load_completed", "load_terminal", "load_analysis")
     ):
         raise TypeError("backtest must expose the frozen BT-PORT operations")
+
+
+def _load_completed(backtest: object, ref: object) -> Mapping[str, object]:
+    try:
+        version = _backtest_ref_version(ref, "completed")
+    except ValueError as error:
+        raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH") from error
+    operation = "load_completed" if version == 1 else "load_completed_v3"
+    loader = getattr(backtest, operation, None)
+    if not callable(loader):
+        raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH")
+    return loader(_plain(ref))
+
+
+def _load_analysis(backtest: object, ref: object) -> Mapping[str, object]:
+    try:
+        version = _backtest_ref_version(ref, "analysis")
+    except ValueError as error:
+        raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH") from error
+    operation = "load_analysis" if version == 1 else "load_analysis_v2"
+    loader = getattr(backtest, operation, None)
+    if not callable(loader):
+        raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH")
+    return loader(_plain(ref))
+
+
+def _is_terminal_ref(value: object) -> bool:
+    plain = _plain(value)
+    return (
+        type(plain) is dict
+        and set(plain) == {"type", "artifact_type", "schema_version", "content_hash"}
+        and plain.get("type") == "artifact_ref"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,12 +730,9 @@ def _trial_observation(
     request = dict(request_spec)
     request["experiment_id"] = canonical_bytes(trial_ref).decode("utf-8")
     run_ref = backtest.run(request)
-    try:
-        return backtest.load_completed(run_ref)
-    except Exception as error:
-        if _failure_code(error) != "PORT_REF_TYPE_MISMATCH":
-            raise
-    return backtest.load_terminal(run_ref)
+    if _is_terminal_ref(run_ref):
+        return backtest.load_terminal(run_ref)
+    return _load_completed(backtest, run_ref)
 
 
 def _verified_analysis(
@@ -739,7 +770,7 @@ def _load_verified_analyses(
             continue
         if type(outcome.witness) is not TrialCompletedPublication:
             raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
-        record = backtest.load_completed(_plain(outcome.witness.publication_ref))
+        record = _load_completed(backtest, outcome.witness.publication_ref)
         try:
             mapped = map_backtest_observation(task, record)
         except (TypeError, ValueError, ResearchCoreError) as error:
@@ -760,7 +791,7 @@ def _load_verified_analyses(
         if type(analysis_task) is not AnalysisTask:
             raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
         trial_outcome = trial_outcomes.get(analysis_task.trial_declaration_ref)
-        record = backtest.load_analysis(_plain(outcome.witness.analysis_ref))  # type: ignore[union-attr]
+        record = _load_analysis(backtest, outcome.witness.analysis_ref)  # type: ignore[union-attr]
         if trial_outcome is None or analysis_task.trial_declaration_ref not in completed:
             raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
         mapped = map_backtest_observation(task, record)
@@ -1257,7 +1288,7 @@ def _completed_record(
 ) -> Mapping[str, object]:
     if type(outcome.witness) is not TrialCompletedPublication:
         raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
-    record = backtest.load_completed(_plain(outcome.witness.publication_ref))
+    record = _load_completed(backtest, outcome.witness.publication_ref)
     mapped = map_backtest_observation(task, record)
     if _wire(mapped.payload) != _wire(outcome.payload):
         raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
@@ -1379,7 +1410,7 @@ def _execute_new(
                 analysis_ref = backtest.derive(
                     _plain(publication_ref), _plain(analysis_task.metric_profile_ref)
                 )
-                analysis = backtest.load_analysis(analysis_ref)
+                analysis = _load_analysis(backtest, analysis_ref)
                 _verified_analysis(task, trial_outcome, record, analysis)
                 outcome = map_backtest_observation(task, analysis)
             except Exception as error:  # noqa: BLE001 - frozen provider boundary
