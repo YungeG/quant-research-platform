@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from crypto_quant_domain import (
@@ -40,12 +40,19 @@ from .integration import (
     TaskAttemptStarted,
     TaskOutcome,
     TaskRef,
+    TargetBuildPublication,
+    TargetBuildTask,
+    TargetMaterializationEvidence,
+    TargetRecipe,
     TrainerRecipe,
     TrialCompletedPublication,
     TrialDeclaration,
     UpstreamTaskOutcome,
     VerifiedAnalysis,
     _backtest_ref_version,
+    _canonical_build_artifact,
+    _canonical_target_stream,
+    _content_hash,
     block_analysis_from_upstream,
     build_candidate_family,
     build_execution_manifest,
@@ -58,6 +65,7 @@ from .integration import (
 )
 
 _RESEARCH_ARTIFACTS_LOG = "research.artifacts.v1"
+_SAMPLE_CONSUMPTION_LOG = "validation.sample-consumption.v1"
 
 
 class _RuntimeFailure(ValueError):
@@ -109,6 +117,14 @@ def _reverse(value: object, refs: Mapping[str, str]) -> object:
     return value
 
 
+def _artifact_schema_versions(artifact_type: str) -> set[int]:
+    if artifact_type == "experiment_spec":
+        return {1, 2}
+    if artifact_type == "strategy_candidate":
+        return {1, 2, 3}
+    return {1}
+
+
 def _publish(
     foundation: LocalFoundation,
     log_name: str,
@@ -117,6 +133,8 @@ def _publish(
     *,
     schema_version: int = 1,
 ):
+    if schema_version not in _artifact_schema_versions(artifact_type):
+        raise ValueError(f"{artifact_type}@{schema_version} is not publishable")
     envelope = ArtifactEnvelope.create(artifact_type, schema_version, payload)
     ref = foundation.put(envelope=envelope)
     receipt = foundation.append(
@@ -140,6 +158,10 @@ def _published_entries(
                 decoded["payload"],
                 decoded["content_hash"],
             )
+            if envelope.schema_version not in _artifact_schema_versions(
+                envelope.artifact_type
+            ):
+                raise ValueError("artifact schema version is not dispatchable")
             if canonical_bytes(envelope) != entry.payload:
                 raise ValueError("entry is not canonical")
             ref = ArtifactRef.from_envelope(envelope)
@@ -250,6 +272,8 @@ class FrozenExperimentInputs:
             raise TypeError("trial_executions must be a tuple of TrialExecution")
         if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
+        if self.experiment_spec.schema_version != 1:
+            raise ResearchCoreError("EXPERIMENT_SPEC_INVALID")
         object.__setattr__(self, "selection_declared_by_ref", _plain(self.selection_declared_by_ref))
 
         trials = build_trial_declarations(self.experiment_spec)
@@ -309,6 +333,8 @@ class FrozenModelExperimentInputs:
                 raise TypeError(f"{name} must be exact {expected_type.__name__}")
         if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
+        if self.experiment_spec.schema_version != 1:
+            raise ResearchCoreError("MODEL_BUILD_PLAN_INVALID")
         if (
             self.experiment_spec.model_build_plan != self.model_build_plan.ref
             or self.model_build_plan.feature_recipe_ref != self.feature_recipe.ref
@@ -339,6 +365,56 @@ class FrozenModelExperimentInputs:
 
 
 @dataclass(frozen=True, slots=True)
+class FrozenTargetExperimentInputs:
+    experiment_spec: ExperimentSpec
+    target_recipe: TargetRecipe
+    selection_policy: SelectionPolicy
+    selection_declared_by_ref: object
+    reservation_at: str
+    max_attempts: int = 1
+
+    def __post_init__(self) -> None:
+        expected = (
+            ("experiment_spec", self.experiment_spec, ExperimentSpec),
+            ("target_recipe", self.target_recipe, TargetRecipe),
+            ("selection_policy", self.selection_policy, SelectionPolicy),
+        )
+        for name, value, expected_type in expected:
+            if type(value) is not expected_type:
+                raise TypeError(f"{name} must be exact {expected_type.__name__}")
+        if type(self.max_attempts) is not int or self.max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
+        if (
+            self.experiment_spec.schema_version != 2
+            or self.experiment_spec.target_recipe_ref != self.target_recipe.ref
+            or self.experiment_spec.model_build_plan is not None
+        ):
+            raise ResearchCoreError("TARGET_RECIPE_INVALID")
+        if not any(
+            _wire(self.selection_policy.metric_profile_ref) == _wire(profile_ref)
+            for profile_ref in self.experiment_spec.metric_profile_refs
+        ):
+            raise ResearchCoreError("SELECTION_POLICY_MISMATCH")
+        declaration = SelectionDeclaration(
+            self.experiment_spec.ref,
+            self.selection_policy.ref,
+            "candidate_trial_declarations_v1",
+            _plain(self.selection_declared_by_ref),
+        )
+        first_slice = self.experiment_spec.data_slices[0]
+        record = SampleConsumptionRecord(
+            first_slice.dataset_revision,
+            first_slice.interval_start,
+            first_slice.interval_end,
+            "discovery",
+            "preflight",
+            self.reservation_at,
+        )
+        object.__setattr__(self, "selection_declared_by_ref", declaration.declared_by_ref)
+        object.__setattr__(self, "reservation_at", record.consumed_at)
+
+
+@dataclass(frozen=True, slots=True)
 class PublishedStrategyCandidate:
     strategy_candidate_ref: ArtifactRef
     candidate_family_ref: ArtifactRef
@@ -356,7 +432,7 @@ class PublishedNoSelection:
 
 @dataclass
 class _PublishedBase:
-    inputs: FrozenExperimentInputs | FrozenModelExperimentInputs
+    inputs: FrozenExperimentInputs | FrozenModelExperimentInputs | FrozenTargetExperimentInputs
     trials: tuple[TrialDeclaration, ...]
     universe: tuple[TaskRef, ...]
     trial_tasks: dict[str, TaskRef]
@@ -366,6 +442,9 @@ class _PublishedBase:
     selection_ledger_sequence: int
     trial_specs: dict[str, ArtifactRef]
     model_build_evidence_ref: ArtifactRef | None = None
+    target_evidence_refs: dict[str, ArtifactRef] = field(default_factory=dict)
+    target_trial_executions: dict[str, TrialExecution] = field(default_factory=dict)
+    trial_preparation_failures: dict[str, str] = field(default_factory=dict)
 
     @property
     def experiment_ref(self) -> ArtifactRef:
@@ -418,6 +497,45 @@ def _normal_model_inputs(value: object) -> FrozenModelExperimentInputs:
     )
 
 
+def _normal_target_inputs(value: object) -> FrozenTargetExperimentInputs:
+    if type(value) is not FrozenTargetExperimentInputs:
+        raise TypeError("frozen_inputs must be FrozenTargetExperimentInputs")
+    return FrozenTargetExperimentInputs(
+        value.experiment_spec,
+        value.target_recipe,
+        value.selection_policy,
+        value.selection_declared_by_ref,
+        value.reservation_at,
+        value.max_attempts,
+    )
+
+
+def _require_target_materializer(materializer: object, recipe: TargetRecipe) -> None:
+    if not callable(getattr(materializer, "materialize_target", None)):
+        raise TypeError("materializer must expose materialize_target")
+    try:
+        artifact = _canonical_build_artifact(
+            getattr(materializer, "strategy_artifact")
+        )
+    except (AttributeError, ValueError) as error:
+        raise TypeError(
+            "materializer must expose exact immutable strategy_artifact"
+        ) from error
+    if _wire(artifact) != _wire(recipe.strategy_artifact):
+        raise ResearchCoreError("TARGET_RECIPE_INVALID")
+
+
+def _require_target_backtest(backtest: object) -> None:
+    _require_backtest(backtest)
+    if not all(
+        callable(getattr(backtest, name, None))
+        for name in ("publish_target", "load_target", "prepare_trials")
+    ):
+        raise TypeError(
+            "backtest must expose publish_target, load_target, and prepare_trials"
+        )
+
+
 def _require_model_builder(builder: object) -> None:
     if not all(
         callable(getattr(builder, name, None))
@@ -433,7 +551,7 @@ def _require_model_backtest(backtest: object) -> None:
 
 
 def _publish_base(
-    inputs: FrozenExperimentInputs | FrozenModelExperimentInputs,
+    inputs: FrozenExperimentInputs | FrozenModelExperimentInputs | FrozenTargetExperimentInputs,
     foundation: LocalFoundation,
     *,
     initial_refs: Mapping[str, ArtifactRef] | None = None,
@@ -452,6 +570,7 @@ def _publish_base(
         _RESEARCH_ARTIFACTS_LOG,
         "experiment_spec",
         _translate(spec.payload, refs),
+        schema_version=spec.schema_version,
     )
     refs[spec.ref] = experiment_ref
 
@@ -468,6 +587,7 @@ def _publish_base(
         "ANALYSIS": (AnalysisTask, "analysis_task"),
         "FEATURE_BUILD": (FeatureBuildTask, "feature_build_task"),
         "MODEL_TRAINING": (ModelTrainingTask, "model_training_task"),
+        "TARGET_BUILD": (TargetBuildTask, "target_build_task"),
     }
     for task in universe:
         if task.kind not in task_types:
@@ -529,10 +649,16 @@ def _publish_trial_specs(
     executions: tuple[TrialExecution, ...],
 ) -> None:
     by_trial = {item.trial_declaration_ref: item for item in executions}
-    if set(by_trial) != {trial.ref for trial in base.trials}:
+    expected = {trial.ref for trial in base.trials}
+    if not set(by_trial).issubset(expected) or (
+        type(base.inputs) is not FrozenTargetExperimentInputs
+        and set(by_trial) != expected
+    ):
         raise ResearchCoreError("TASK_REF_FOREIGN")
     for trial in base.trials:
-        execution = by_trial[trial.ref]
+        execution = by_trial.get(trial.ref)
+        if execution is None:
+            continue
         ref, _ = _publish(
             foundation,
             _RESEARCH_ARTIFACTS_LOG,
@@ -611,6 +737,207 @@ def _recover_model_publications(
         actual_to_core[_wire(_ref_payload(ref))] = value.ref
         base.refs[value.ref] = ref
     return feature_manifest, model_evidence
+
+
+def _publish_target_base(
+    inputs: FrozenTargetExperimentInputs,
+    foundation: LocalFoundation,
+) -> _PublishedBase:
+    recipe_ref, _ = _publish(
+        foundation,
+        _RESEARCH_ARTIFACTS_LOG,
+        "target_recipe",
+        inputs.target_recipe.payload,
+    )
+    return _publish_base(
+        inputs,
+        foundation,
+        initial_refs={inputs.target_recipe.ref: recipe_ref},
+        publish_trial_specs=False,
+    )
+
+
+def _target_reservation_bytes(
+    base: _PublishedBase, trial: TrialDeclaration
+) -> bytes:
+    producer_ref = base.refs[trial.ref]
+    record = SampleConsumptionRecord(
+        trial.data_slice.dataset_revision,
+        trial.data_slice.interval_start,
+        trial.data_slice.interval_end,
+        "discovery",
+        canonical_sha256(("sample-consumer-v1", producer_ref)),
+        base.inputs.reservation_at,
+    )
+    return canonical_bytes(
+        ArtifactEnvelope.create(
+            "sample_consumption_append",
+            1,
+            {
+                "record": {
+                    "dataset_revision": record.dataset_revision,
+                    "interval_start": record.interval_start,
+                    "interval_end": record.interval_end,
+                    "purpose": record.purpose,
+                    "consumer_id": record.consumer_id,
+                    "consumed_at": record.consumed_at,
+                },
+                "producer_ref": producer_ref,
+            },
+        )
+    )
+
+
+def _require_target_reservation(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+    trial: TrialDeclaration,
+    evidence_ledger_sequence: int,
+) -> None:
+    matches = tuple(
+        entry
+        for entry in foundation.entries(_SAMPLE_CONSUMPTION_LOG)
+        if entry.payload == _target_reservation_bytes(base, trial)
+    )
+    expected_event_id = canonical_sha256(
+        (
+            "sample-consumption-append-v1",
+            base.refs[trial.ref],
+            trial.data_slice.dataset_revision,
+            trial.data_slice.interval_start,
+            trial.data_slice.interval_end,
+            "discovery",
+        )
+    )
+    if (
+        len(matches) != 1
+        or matches[0].event_id != expected_event_id
+        or base.inputs.reservation_at > matches[0].accepted_at
+        or matches[0].ledger_sequence >= evidence_ledger_sequence
+    ):
+        raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+
+
+def _verified_target(
+    backtest: object,
+    target_ref: object,
+    producer_context_ref: ArtifactRef,
+    *,
+    expected_digest: str,
+    expected_event_count: int,
+    expected_stream: object | None = None,
+) -> Mapping[str, object]:
+    try:
+        loaded = _plain(backtest.load_target(_plain(target_ref)))
+        if type(loaded) is not dict or set(loaded) != {
+            "ref",
+            "producer_context_ref",
+            "target_stream",
+            "digest",
+        }:
+            raise ValueError("load_target returned the wrong record")
+        stream = _canonical_target_stream(loaded["target_stream"])
+        digest = canonical_sha256(stream)
+        if (
+            _wire(loaded["ref"]) != _wire(target_ref)
+            or _wire(loaded["producer_context_ref"])
+            != _wire(_ref_payload(producer_context_ref))
+            or loaded["digest"] != digest
+            or loaded["digest"] != expected_digest
+            or len(stream["events"]) != expected_event_count
+            or (
+                expected_stream is not None
+                and _wire(stream) != _wire(expected_stream)
+            )
+        ):
+            raise ValueError("loaded target does not exactly bind its evidence")
+        return loaded
+    except Exception as error:  # noqa: BLE001 - target repository boundary
+        raise _RuntimeFailure("TARGET_STORE_INVALID") from error
+
+
+def _recover_target_publications(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+    backtest: object,
+) -> dict[str, TargetMaterializationEvidence]:
+    actual_to_core = {
+        _wire(_ref_payload(ref)): local_ref for local_ref, ref in base.refs.items()
+    }
+    task_by_ref = {
+        task.task_artifact_ref: task
+        for task in base.universe
+        if task.kind == "TARGET_BUILD"
+    }
+    trial_by_ref = {trial.ref: trial for trial in base.trials}
+    recovered: dict[str, TargetMaterializationEvidence] = {}
+    trial_ref_by_wire = {
+        _wire(_ref_payload(base.refs[trial.ref])): trial.ref for trial in base.trials
+    }
+    for entry, ref, payload in _published_entries(foundation, _RESEARCH_ARTIFACTS_LOG):
+        if ref.artifact_type == "backtest_trial_spec":
+            trial_ref = trial_ref_by_wire.get(
+                _wire(payload.get("trial_declaration_ref"))
+            )
+            if trial_ref is not None:
+                existing = base.trial_specs.get(trial_ref)
+                if existing is not None and existing != ref:
+                    raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+                base.trial_specs[trial_ref] = ref
+            continue
+        if ref.artifact_type != "target_materialization_evidence":
+            continue
+        converted = _reverse(payload, actual_to_core)
+        if type(converted) is not dict:
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+        try:
+            evidence = TargetMaterializationEvidence(
+                converted["target_build_task_ref"],
+                converted["trial_declaration_ref"],
+                converted["target_recipe_ref"],
+                converted["materialization_request_hash"],
+                converted["input_data_hash"],
+                converted["target_stream_ref"],
+                converted["target_stream_digest"],
+                converted["event_count"],
+            )
+        except (KeyError, TypeError, ValueError, ResearchCoreError) as error:
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID") from error
+        task = task_by_ref.get(evidence.target_build_task_ref)
+        trial = trial_by_ref.get(evidence.trial_declaration_ref)
+        if task is None or trial is None or type(task.artifact) is not TargetBuildTask:
+            continue
+        if (
+            task.artifact.trial_declaration_ref != trial.ref
+            or task.artifact.target_recipe_ref
+            != base.inputs.experiment_spec.target_recipe_ref
+            or evidence.target_recipe_ref
+            != base.inputs.experiment_spec.target_recipe_ref
+            or evidence.materialization_request_hash
+            != canonical_sha256(_target_request(base, trial))
+        ):
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+        _require_target_reservation(
+            base, foundation, trial, entry.ledger_sequence
+        )
+        try:
+            _verified_target(
+                backtest,
+                evidence.target_stream_ref,
+                base.refs[trial.ref],
+                expected_digest=evidence.target_stream_digest,
+                expected_event_count=evidence.event_count,
+            )
+        except _RuntimeFailure as error:
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID") from error
+        existing = recovered.get(trial.ref)
+        if existing is not None and existing != evidence:
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+        recovered[trial.ref] = evidence
+        base.refs[evidence.ref] = ref
+        base.target_evidence_refs[trial.ref] = ref
+        actual_to_core[_wire(_ref_payload(ref))] = evidence.ref
+    return recovered
 
 
 def _reserve_slice(
@@ -868,6 +1195,13 @@ def _candidate_payload(
         payload["model_build_evidence_ref"] = _ref_payload(
             base.model_build_evidence_ref
         )
+    target_evidence_ref = base.target_evidence_refs.get(trial_ref)
+    if base.inputs.experiment_spec.target_recipe_ref is not None:
+        if target_evidence_ref is None:
+            raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
+        payload["selected_target_materialization_evidence_ref"] = _ref_payload(
+            target_evidence_ref
+        )
     return payload
 
 
@@ -902,7 +1236,13 @@ def _select_and_publish(
         )
 
     payload = _candidate_payload(base, family_ref, selected)
-    candidate_version = 2 if base.model_build_evidence_ref is not None else 1
+    candidate_version = (
+        3
+        if base.inputs.experiment_spec.target_recipe_ref is not None
+        else 2
+        if base.model_build_evidence_ref is not None
+        else 1
+    )
     expected = ArtifactRef.from_envelope(
         ArtifactEnvelope.create("strategy_candidate", candidate_version, payload)
     )
@@ -955,6 +1295,7 @@ def _foreign_task_for_experiment(
         if candidate["type"] != "artifact_ref" or ref.artifact_type not in {
             "trial_declaration",
             "analysis_task",
+            "target_build_task",
         }:
             return False
         source = foundation.read(ref=ref).source_bytes
@@ -1295,6 +1636,288 @@ def _completed_record(
     return record
 
 
+def _target_request(
+    base: _PublishedBase,
+    trial: TrialDeclaration,
+) -> dict[str, object]:
+    target_recipe_ref = base.inputs.experiment_spec.target_recipe_ref
+    if type(target_recipe_ref) is not str:
+        raise ResearchCoreError("TARGET_RECIPE_INVALID")
+    return {
+        "type": "target_materialization_request",
+        "schema_version": 1,
+        "consumer_ref": _ref_payload(base.refs[trial.ref]),
+        "target_recipe_ref": _ref_payload(base.refs[target_recipe_ref]),
+        "market_bundle_ref": _plain(trial.data_slice.market_bundle_ref),
+        "dataset_revision": _plain(trial.data_slice.dataset_revision),
+        "interval_start": _plain(trial.data_slice.interval_start),
+        "interval_end": _plain(trial.data_slice.interval_end),
+        "parameter_values": _plain(trial.parameter_values.payload),
+        "seed": trial.seed,
+    }
+
+
+def _materialize_target(
+    base: _PublishedBase,
+    materializer: object,
+    backtest: object,
+    task: TaskRef,
+    trial: TrialDeclaration,
+) -> TargetMaterializationEvidence:
+    if type(base.inputs) is not FrozenTargetExperimentInputs:
+        raise TypeError("target materialization requires FrozenTargetExperimentInputs")
+    request = _target_request(base, trial)
+    request_hash = canonical_sha256(request)
+    materializer_request = _plain(request)
+    try:
+        result_value = materializer.materialize_target(materializer_request)
+    except Exception as error:  # noqa: BLE001 - materializer boundary
+        raise _RuntimeFailure("TARGET_MATERIALIZATION_INVALID") from error
+    if _wire(materializer_request) != _wire(request):
+        raise _RuntimeFailure("TARGET_MATERIALIZATION_INVALID")
+    result = _plain(result_value)
+    if type(result) is not dict or set(result) != {
+        "type",
+        "schema_version",
+        "request_hash",
+        "strategy_artifact",
+        "input_data_hash",
+        "target_stream",
+    }:
+        raise _RuntimeFailure("TARGET_MATERIALIZATION_INVALID")
+    try:
+        strategy_artifact = _canonical_build_artifact(result["strategy_artifact"])
+        target_stream = _canonical_target_stream(result["target_stream"])
+    except ValueError as error:
+        raise _RuntimeFailure("TARGET_MATERIALIZATION_INVALID") from error
+    if (
+        result["type"] != "target_materialization_result"
+        or result["schema_version"] != 1
+        or result["request_hash"] != request_hash
+        or _wire(strategy_artifact) != _wire(base.inputs.target_recipe.strategy_artifact)
+        or _wire(strategy_artifact)
+        != _wire(_canonical_build_artifact(materializer.strategy_artifact))
+    ):
+        raise _RuntimeFailure("TARGET_MATERIALIZATION_INVALID")
+    input_data_hash = result["input_data_hash"]
+    try:
+        _content_hash(input_data_hash, "input_data_hash")
+    except ValueError as error:
+        raise _RuntimeFailure("TARGET_MATERIALIZATION_INVALID") from error
+    try:
+        target_ref = _plain(
+            backtest.publish_target(
+                _ref_payload(base.refs[trial.ref]),
+                _plain(target_stream),
+            )
+        )
+    except Exception as error:  # noqa: BLE001 - target repository boundary
+        raise _RuntimeFailure("TARGET_STORE_INVALID") from error
+    expected_digest = canonical_sha256(target_stream)
+    _verified_target(
+        backtest,
+        target_ref,
+        base.refs[trial.ref],
+        expected_digest=expected_digest,
+        expected_event_count=len(target_stream["events"]),
+        expected_stream=target_stream,
+    )
+    return TargetMaterializationEvidence(
+        task.task_artifact_ref,
+        trial.ref,
+        base.inputs.target_recipe.ref,
+        request_hash,
+        input_data_hash,
+        target_ref,
+        expected_digest,
+        len(target_stream["events"]),
+    )
+
+
+def _execute_target_builds(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+    ledger: SampleConsumptionLedger,
+    materializer: object,
+    backtest: object,
+    evidences: dict[str, TargetMaterializationEvidence],
+) -> dict[str, TargetMaterializationEvidence]:
+    recovery = _recover_execution(base, foundation)
+    _close_persisted_outcomes(base, foundation, recovery)
+    target_tasks = {
+        task.artifact.trial_declaration_ref: task
+        for task in base.universe
+        if task.kind == "TARGET_BUILD" and type(task.artifact) is TargetBuildTask
+    }
+    for trial in base.trials:
+        task = target_tasks[trial.ref]
+        evidence = evidences.get(trial.ref)
+        if task in recovery.outcomes:
+            outcome = recovery.outcomes[task]
+            if (
+                outcome.state == "COMPLETED"
+                and (
+                    evidence is None
+                    or type(outcome.witness) is not TargetBuildPublication
+                    or outcome.witness.target_materialization_evidence_ref != evidence.ref
+                )
+            ) or (outcome.state != "COMPLETED" and evidence is not None):
+                raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+            continue
+        started = _resume_attempt(base, foundation, recovery, task)
+        if evidence is not None:
+            outcome = TaskOutcome(
+                task,
+                "COMPLETED",
+                TargetBuildPublication(evidence.ref),
+            )
+            _append_recovered_terminal(
+                base, foundation, recovery, started, outcome
+            )
+            continue
+        try:
+            _reserve(
+                ledger,
+                base.refs[trial.ref],
+                trial,
+                "discovery",
+                base.inputs.reservation_at,
+            )
+        except Exception:  # noqa: BLE001 - reservation boundary blocks materialization
+            outcome = TaskOutcome(
+                task,
+                "BLOCKED",
+                DependencyBlock("SAMPLE_RESERVATION_FAILED"),
+            )
+            _append_recovered_terminal(
+                base, foundation, recovery, started, outcome
+            )
+            continue
+        while True:
+            try:
+                evidence = _materialize_target(
+                    base, materializer, backtest, task, trial
+                )
+                try:
+                    ref, _ = _publish(
+                        foundation,
+                        _RESEARCH_ARTIFACTS_LOG,
+                        "target_materialization_evidence",
+                        _translate(evidence.payload, base.refs),
+                    )
+                except Exception as error:
+                    raise _RuntimeFailure(
+                        "TARGET_EVIDENCE_PUBLICATION_FAILED"
+                    ) from error
+                base.refs[evidence.ref] = ref
+                base.target_evidence_refs[trial.ref] = ref
+                evidences[trial.ref] = evidence
+                outcome = TaskOutcome(
+                    task,
+                    "COMPLETED",
+                    TargetBuildPublication(evidence.ref),
+                )
+            except Exception as error:  # noqa: BLE001 - materializer/storage boundary
+                committed = _recover_target_publications(
+                    base, foundation, backtest
+                ).get(trial.ref)
+                if committed is not None:
+                    evidence = committed
+                    evidences[trial.ref] = committed
+                    outcome = TaskOutcome(
+                        task,
+                        "COMPLETED",
+                        TargetBuildPublication(committed.ref),
+                    )
+                elif started.ordinal < base.inputs.max_attempts:
+                    _append_retryable_close(
+                        base,
+                        foundation,
+                        recovery,
+                        started,
+                        _failure_code(error),
+                    )
+                    started = _resume_attempt(base, foundation, recovery, task)
+                    continue
+                else:
+                    outcome = TaskOutcome(
+                        task,
+                        "FAILED",
+                        LocalFailure(_failure_code(error)),
+                    )
+            _append_recovered_terminal(
+                base, foundation, recovery, started, outcome
+            )
+            break
+    return evidences
+
+
+def _prepare_target_trials(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+    backtest: object,
+    evidences: Mapping[str, TargetMaterializationEvidence],
+) -> None:
+    executions: list[TrialExecution] = []
+    recovery = _recover_execution(base, foundation)
+    target_outcomes = {
+        task.artifact.trial_declaration_ref: recovery.outcomes[task]
+        for task in base.universe
+        if task.kind == "TARGET_BUILD"
+        and type(task.artifact) is TargetBuildTask
+        and task in recovery.outcomes
+    }
+    for trial in base.trials:
+        outcome = target_outcomes[trial.ref]
+        if outcome.state != "COMPLETED":
+            continue
+        evidence = evidences.get(trial.ref)
+        if evidence is None:
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+        try:
+            prepared = backtest.prepare_trials(
+                (trial,), _plain(evidence.target_stream_ref)
+            )
+            if (
+                type(prepared) is not tuple
+                or len(prepared) != 1
+                or type(prepared[0]) is not TrialExecution
+                or prepared[0].trial_declaration_ref != trial.ref
+                or prepared[0].resolved_model_refs
+            ):
+                raise TypeError(
+                    "prepare_trials must return one exact target TrialExecution"
+                )
+            executions.append(prepared[0])
+            base.target_trial_executions[trial.ref] = prepared[0]
+        except Exception:  # noqa: BLE001 - preparation boundary
+            base.trial_preparation_failures[trial.ref] = (
+                "TARGET_PREPARATION_FAILED"
+            )
+    request_wires: dict[str, list[str]] = {}
+    for execution in executions:
+        request_wires.setdefault(
+            _wire(execution.backtest_request_ref), []
+        ).append(execution.trial_declaration_ref)
+    collisions = {
+        trial_ref
+        for trial_refs in request_wires.values()
+        if len(trial_refs) > 1
+        for trial_ref in trial_refs
+    }
+    if collisions:
+        executions = [
+            execution
+            for execution in executions
+            if execution.trial_declaration_ref not in collisions
+        ]
+        for trial_ref in collisions:
+            base.target_trial_executions.pop(trial_ref, None)
+            base.trial_preparation_failures[trial_ref] = "TRIAL_REQUEST_COLLISION"
+    if executions:
+        _publish_trial_specs(base, foundation, tuple(executions))
+
+
 def _execute_new(
     base: _PublishedBase,
     foundation: LocalFoundation,
@@ -1305,6 +1928,7 @@ def _execute_new(
         item.trial_declaration_ref: item
         for item in getattr(base.inputs, "trial_executions", ())
     }
+    executions.update(base.target_trial_executions)
     recovery = _recover_execution(base, foundation)
     _close_persisted_outcomes(base, foundation, recovery)
     completed_records: dict[str, Mapping[str, object]] = {}
@@ -1316,12 +1940,20 @@ def _execute_new(
         ),
         None,
     )
+    target_outcomes = {
+        task.artifact.trial_declaration_ref: recovery.outcomes[task]
+        for task in base.universe
+        if task.kind == "TARGET_BUILD"
+        and type(task.artifact) is TargetBuildTask
+        and task in recovery.outcomes
+    }
 
     for trial in base.trials:
         task = base.trial_tasks[trial.ref]
         if task in recovery.outcomes:
             continue
-        if training_outcome is not None and training_outcome.state != "COMPLETED":
+        upstream = training_outcome or target_outcomes.get(trial.ref)
+        if upstream is not None and upstream.state != "COMPLETED":
             started = _resume_attempt(base, foundation, recovery, task)
             _append_recovered_terminal(
                 base,
@@ -1331,23 +1963,39 @@ def _execute_new(
                 TaskOutcome(
                     task,
                     "BLOCKED",
-                    UpstreamTaskOutcome(training_outcome.ref),
+                    UpstreamTaskOutcome(upstream.ref),
                 ),
+            )
+            continue
+        preparation_failure = base.trial_preparation_failures.get(trial.ref)
+        if preparation_failure is not None:
+            started = _resume_attempt(base, foundation, recovery, task)
+            _append_recovered_terminal(
+                base,
+                foundation,
+                recovery,
+                started,
+                TaskOutcome(task, "FAILED", LocalFailure(preparation_failure)),
             )
             continue
         execution = executions.get(trial.ref)
         if execution is None:
-            raise ResearchCoreError("MODEL_BINDING_INVALID")
+            raise ResearchCoreError(
+                "TARGET_MATERIALIZATION_INVALID"
+                if target_outcomes
+                else "MODEL_BINDING_INVALID"
+            )
         while True:
             started = _resume_attempt(base, foundation, recovery, task)
             try:
-                _reserve(
-                    ledger,
-                    base.refs[trial.ref],
-                    trial,
-                    "discovery",
-                    base.inputs.reservation_at,
-                )
+                if trial.ref not in target_outcomes:
+                    _reserve(
+                        ledger,
+                        base.refs[trial.ref],
+                        trial,
+                        "discovery",
+                        base.inputs.reservation_at,
+                    )
             except Exception:  # noqa: BLE001 - reservation boundary blocks the read
                 outcome = TaskOutcome(
                     task,
@@ -1674,6 +2322,39 @@ def _execute_model_build(
     return model_evidence
 
 
+def execute_target_experiment(
+    frozen_inputs: FrozenTargetExperimentInputs,
+    foundation: LocalFoundation,
+    sample_ledger: SampleConsumptionLedger,
+    materializer: object,
+    backtest: object,
+) -> PublishedStrategyCandidate | PublishedNoSelection:
+    """Publish one reserved target materialization per Trial and execute it."""
+
+    inputs = _normal_target_inputs(frozen_inputs)
+    if type(foundation) is not LocalFoundation:
+        raise TypeError("foundation must be a LocalFoundation")
+    if type(sample_ledger) is not SampleConsumptionLedger:
+        raise TypeError("sample_ledger must be a SampleConsumptionLedger")
+    _require_target_materializer(materializer, inputs.target_recipe)
+    _require_target_backtest(backtest)
+    base = _publish_target_base(inputs, foundation)
+    evidences = _recover_target_publications(base, foundation, backtest)
+    existing = _replay_existing(base, foundation, sample_ledger, backtest)
+    if existing is not None:
+        return existing
+    evidences = _execute_target_builds(
+        base,
+        foundation,
+        sample_ledger,
+        materializer,
+        backtest,
+        evidences,
+    )
+    _prepare_target_trials(base, foundation, backtest, evidences)
+    return _execute_new(base, foundation, sample_ledger, backtest)
+
+
 def execute_model_experiment(
     frozen_inputs: FrozenModelExperimentInputs,
     foundation: LocalFoundation,
@@ -1752,9 +2433,11 @@ def execute_experiment(
 __all__ = [
     "FrozenExperimentInputs",
     "FrozenModelExperimentInputs",
+    "FrozenTargetExperimentInputs",
     "PublishedNoSelection",
     "PublishedStrategyCandidate",
     "TrialExecution",
     "execute_experiment",
     "execute_model_experiment",
+    "execute_target_experiment",
 ]

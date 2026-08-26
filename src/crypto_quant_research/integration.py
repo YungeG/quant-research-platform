@@ -13,6 +13,8 @@ from typing import Any
 RESEARCH_EXECUTION_LOG = "research.execution.v1"
 FAILURE_PRECEDENCE = (
     "MODEL_BUILD_PLAN_INVALID",
+    "TARGET_RECIPE_INVALID",
+    "TARGET_MATERIALIZATION_INVALID",
     "TASK_AXIS_DUPLICATE",
     "MODEL_TRAINING_BLOCKED",
     "MODEL_TRAINING_FAILED",
@@ -49,11 +51,20 @@ _LOCAL_REF_TYPES = {
     "model_training_task",
     "feature_dataset_manifest",
     "model_build_evidence",
+    "target_recipe",
+    "target_build_task",
+    "target_materialization_evidence",
 }
 _LOCAL_REF = re.compile(
-    r"rp-core:(?P<artifact_type>[a-z][a-z0-9_]*)@1:sha256:[0-9a-f]{64}"
+    r"rp-core:(?P<artifact_type>[a-z][a-z0-9_]*)@(?P<schema_version>[12]):sha256:[0-9a-f]{64}"
 )
-_TASK_KINDS = {"FEATURE_BUILD", "MODEL_TRAINING", "TRIAL", "ANALYSIS"}
+_TASK_KINDS = {
+    "FEATURE_BUILD",
+    "MODEL_TRAINING",
+    "TARGET_BUILD",
+    "TRIAL",
+    "ANALYSIS",
+}
 _OUTCOME_STATES = {"COMPLETED", "BLOCKED", "FAILED", "CANCELLED"}
 _TERMINAL_STATES = {"BLOCKED", "FAILED", "CANCELLED"}
 _BACKTEST_REF_VARIANTS = {
@@ -232,12 +243,14 @@ def _backtest_ref_version(value: object, kind: str) -> int:
     return _BACKTEST_REF_VARIANTS[kind][plain["type"]]  # type: ignore[index]
 
 
-def _local_ref(artifact_type: str, payload: object) -> str:
+def _local_ref(
+    artifact_type: str, payload: object, *, schema_version: int = 1
+) -> str:
     """Deterministic pre-seam handle; deliberately not a Domain ArtifactRef."""
 
     preimage = ("rp-core-local-ref-v1", artifact_type, payload)
     digest = hashlib.sha256(_canonical_json(preimage).encode("utf-8")).hexdigest()
-    return f"rp-core:{artifact_type}@1:sha256:{digest}"
+    return f"rp-core:{artifact_type}@{schema_version}:sha256:{digest}"
 
 
 def _canonical_utc(value: object, name: str) -> str:
@@ -363,6 +376,174 @@ def _canonical_model_artifact(value: object) -> Mapping[str, object]:
     return _freeze_json(plain)  # type: ignore[return-value]
 
 
+def _canonical_build_artifact(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        encoder = getattr(value, "to_canonical_dict", None)
+        if not callable(encoder):
+            raise ValueError(
+                "strategy_artifact must be the exact BuildArtifactRef wire"
+            )
+        value = encoder()
+    fields = {
+        "type",
+        "role",
+        "artifact_key",
+        "artifact_version",
+        "install_mode",
+        "source_tree_state",
+        "content_hash",
+        "source_snapshot_hash",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("strategy_artifact must be the exact BuildArtifactRef wire")
+    plain = _plain_json(value)
+    if type(plain) is not dict:
+        raise ValueError("strategy_artifact must be canonical")
+    if plain["type"] != "build_artifact_ref" or plain["role"] != "decision_source":
+        raise ValueError("strategy_artifact must be a DECISION_SOURCE BuildArtifactRef")
+    _nonempty_string(plain["artifact_key"], "strategy_artifact.artifact_key")
+    _nonempty_string(plain["artifact_version"], "strategy_artifact.artifact_version")
+    if plain["install_mode"] not in {"wheel", "container", "editable"}:
+        raise ValueError("strategy_artifact.install_mode is invalid")
+    if plain["source_tree_state"] not in {"clean", "dirty", "unknown"}:
+        raise ValueError("strategy_artifact.source_tree_state is invalid")
+    for name in ("content_hash", "source_snapshot_hash"):
+        if plain[name] is not None:
+            _content_hash(plain[name], f"strategy_artifact.{name}")
+    if plain["content_hash"] is None and plain["source_snapshot_hash"] is None:
+        raise ValueError("strategy_artifact must have immutable identity")
+    return _freeze_json(plain)  # type: ignore[return-value]
+
+
+def _canonical_target_stream(value: object) -> Mapping[str, object]:
+    stream_fields = {"type", "schema_version", "stream_key", "events"}
+    event_fields = {
+        "type",
+        "event_id",
+        "stream_key",
+        "event_type",
+        "capability",
+        "instrument_id",
+        "event_time",
+        "available_time",
+        "phase",
+        "source_sequence",
+        "revision_id",
+        "supersedes_revision_id",
+        "source_key",
+        "source_hash",
+        "payload",
+    }
+    plain = _plain_json(value)
+    if type(plain) is not dict or set(plain) != stream_fields:
+        raise ValueError("target_stream must be the exact PrecomputedTargetStream wire")
+    if (
+        plain["type"] != "precomputed_target_stream"
+        or plain["schema_version"] != 1
+    ):
+        raise ValueError("target_stream must be precomputed_target_stream@1")
+    stream_key = _nonempty_string(plain["stream_key"], "target_stream.stream_key")
+    events = plain["events"]
+    if type(events) is not list:
+        raise ValueError("target_stream.events must be a canonical sequence")
+    normalized: list[dict[str, object]] = []
+    ordering: list[tuple[int, int, str, int, str]] = []
+    for event in events:
+        if type(event) is not dict or set(event) != event_fields:
+            raise ValueError("target_stream event fields are not canonical")
+        if event["type"] != "market_event":
+            raise ValueError("target_stream events must be MarketEvent values")
+        event_id = _nonempty_string(event["event_id"], "target event.event_id")
+        if event["stream_key"] != stream_key:
+            raise ValueError("target event stream_key does not match its stream")
+        _nonempty_string(event["event_type"], "target event.event_type")
+        capability = event["capability"]
+        if (
+            type(capability) is not dict
+            or set(capability) != {"type", "key", "version"}
+            or capability["type"] != "market_bundle_capability"
+            or type(capability["key"]) is not str
+            or not capability["key"]
+            or type(capability["version"]) is not int
+            or capability["version"] <= 0
+        ):
+            raise ValueError("target event capability is invalid")
+        if event["instrument_id"] is not None:
+            instrument = event["instrument_id"]
+            if (
+                type(instrument) is not dict
+                or set(instrument) != {"type", "venue", "stable_key"}
+                or instrument["type"] != "instrument_id"
+            ):
+                raise ValueError("target event instrument_id is invalid")
+        instants: list[int] = []
+        for name in ("event_time", "available_time"):
+            instant = event[name]
+            if (
+                type(instant) is not dict
+                or set(instant) != {"type", "epoch_nanoseconds"}
+                or instant["type"] != "utc_instant"
+                or type(instant["epoch_nanoseconds"]) is not int
+            ):
+                raise ValueError(f"target event {name} is invalid")
+            instants.append(instant["epoch_nanoseconds"])
+        if instants[1] < instants[0]:
+            raise ValueError("target event is available before event_time")
+        phase = event["phase"]
+        if (
+            type(phase) is not dict
+            or set(phase) != {"type", "rank", "code"}
+            or phase["type"] != "timeline_phase"
+            or type(phase["rank"]) is not int
+            or type(phase["code"]) is not str
+            or not phase["code"]
+        ):
+            raise ValueError("target event phase is invalid")
+        sequence = event["source_sequence"]
+        if (
+            type(sequence) is not dict
+            or set(sequence) != {"type", "value"}
+            or sequence["type"] != "source_sequence"
+            or type(sequence["value"]) is not int
+        ):
+            raise ValueError("target event source_sequence is invalid")
+        _nonempty_string(event["revision_id"], "target event.revision_id")
+        if event["supersedes_revision_id"] is not None:
+            _nonempty_string(
+                event["supersedes_revision_id"],
+                "target event.supersedes_revision_id",
+            )
+        _nonempty_string(event["source_key"], "target event.source_key")
+        _content_hash(event["source_hash"], "target event.source_hash")
+        if type(event["payload"]) is not dict:
+            raise ValueError("target event payload must be a canonical object")
+        normalized.append(event)
+        ordering.append(
+            (
+                instants[1],
+                phase["rank"],
+                phase["code"],
+                sequence["value"],
+                event_id,
+            )
+        )
+    if len({event["event_id"] for event in normalized}) != len(normalized):
+        raise ValueError("target event IDs must be unique")
+    keys = tuple(item[:4] for item in ordering)
+    if len(set(keys)) != len(keys) or ordering != sorted(ordering):
+        raise ValueError("target events must have unique canonical ordering")
+    return _freeze_json(plain)  # type: ignore[return-value]
+
+
+def _canonical_target_stream_ref(value: object, name: str) -> object:
+    return _canonical_ref(
+        value,
+        name,
+        expected_type="backtest_target_stream_ref",
+        expected_artifact_type="backtest_target_stream",
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class DataSlice:
     market_bundle_ref: object
@@ -405,6 +586,47 @@ class DataSlice:
     @property
     def canonical_wire(self) -> str:
         return _canonical_json(self.payload)
+
+
+@dataclass(frozen=True, slots=True)
+class TargetRecipe:
+    target_key: str
+    strategy_artifact: object
+    target_schema_hash: str
+    input_names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        try:
+            _nonempty_string(self.target_key, "target_key")
+            object.__setattr__(
+                self,
+                "strategy_artifact",
+                _canonical_build_artifact(self.strategy_artifact),
+            )
+            _content_hash(self.target_schema_hash, "target_schema_hash")
+            if type(self.input_names) is not tuple or not self.input_names:
+                raise ValueError("input_names must be a nonempty tuple")
+            names = tuple(_nonempty_string(item, "input_name") for item in self.input_names)
+            if names != tuple(sorted(names)) or len(names) != len(set(names)):
+                raise ValueError("input_names must be unique and sorted")
+            object.__setattr__(self, "input_names", names)
+        except ValueError as error:
+            _fail("TARGET_RECIPE_INVALID", str(error))
+
+    @property
+    def payload(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "target_key": self.target_key,
+                "strategy_artifact": self.strategy_artifact,
+                "target_schema_hash": self.target_schema_hash,
+                "input_names": self.input_names,
+            }
+        )
+
+    @property
+    def ref(self) -> object:
+        return _local_ref("target_recipe", self.payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -684,11 +906,18 @@ class ExperimentSpec:
     model_build_plan: object | None
     metric_profile_refs: tuple[object, ...]
     budget: object
+    target_recipe_ref: object | None = None
 
     def __post_init__(self) -> None:
         plan = self.model_build_plan
+        target_recipe_ref = self.target_recipe_ref
         if plan is not None and type(plan) is not ModelBuildPlan:
             _fail("MODEL_BUILD_PLAN_INVALID", "model_build_plan must be a ModelBuildPlan")
+        if plan is not None and target_recipe_ref is not None:
+            _fail(
+                "EXPERIMENT_SPEC_INVALID",
+                "target mode excludes model_build_plan",
+            )
         try:
             object.__setattr__(
                 self,
@@ -708,6 +937,16 @@ class ExperimentSpec:
             if self.budget is None or type(self.budget) is bool:
                 raise ValueError("budget must be an explicit canonical value")
             object.__setattr__(self, "budget", _freeze_json(self.budget))
+            if target_recipe_ref is not None:
+                object.__setattr__(
+                    self,
+                    "target_recipe_ref",
+                    _canonical_ref(
+                        target_recipe_ref,
+                        "target_recipe_ref",
+                        expected_artifact_type="target_recipe",
+                    ),
+                )
         except ValueError as error:
             _fail("EXPERIMENT_SPEC_INVALID", str(error))
 
@@ -786,26 +1025,33 @@ class ExperimentSpec:
 
     @property
     def payload(self) -> Mapping[str, object]:
-        return MappingProxyType(
-            {
-                "hypothesis_ref": self.hypothesis_ref,
-                "strategy_definition_ref": self.strategy_definition_ref,
-                "data_slices": tuple(item.payload for item in self.data_slices),
-                "parameter_combinations": tuple(
-                    item.payload for item in self.parameter_combinations
-                ),
-                "seeds": self.seeds,
-                "scenario_refs": self.scenario_refs,
-                "backtest_template_ref": self.backtest_template_ref,
-                "model_build_plan": self.model_build_plan,
-                "metric_profile_refs": self.metric_profile_refs,
-                "budget": self.budget,
-            }
-        )
+        payload = {
+            "hypothesis_ref": self.hypothesis_ref,
+            "strategy_definition_ref": self.strategy_definition_ref,
+            "data_slices": tuple(item.payload for item in self.data_slices),
+            "parameter_combinations": tuple(
+                item.payload for item in self.parameter_combinations
+            ),
+            "seeds": self.seeds,
+            "scenario_refs": self.scenario_refs,
+            "backtest_template_ref": self.backtest_template_ref,
+            "model_build_plan": self.model_build_plan,
+            "metric_profile_refs": self.metric_profile_refs,
+            "budget": self.budget,
+        }
+        if self.target_recipe_ref is not None:
+            payload["target_recipe_ref"] = self.target_recipe_ref
+        return MappingProxyType(payload)
+
+    @property
+    def schema_version(self) -> int:
+        return 2 if self.target_recipe_ref is not None else 1
 
     @property
     def ref(self) -> object:
-        return _local_ref("experiment_spec", self.payload)
+        return _local_ref(
+            "experiment_spec", self.payload, schema_version=self.schema_version
+        )
 
     @property
     def experiment_ref(self) -> object:
@@ -1035,11 +1281,149 @@ class ModelTrainingTask:
         return _local_ref("model_training_task", self.payload)
 
 
-TaskArtifact = TrialDeclaration | AnalysisTask | FeatureBuildTask | ModelTrainingTask
+@dataclass(frozen=True, slots=True)
+class TargetBuildTask:
+    experiment_ref: object
+    trial_declaration_ref: object
+    target_recipe_ref: object
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(
+                self,
+                "experiment_ref",
+                _canonical_ref(
+                    self.experiment_ref,
+                    "experiment_ref",
+                    expected_artifact_type="experiment_spec",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "trial_declaration_ref",
+                _canonical_ref(
+                    self.trial_declaration_ref,
+                    "trial_declaration_ref",
+                    expected_artifact_type="trial_declaration",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "target_recipe_ref",
+                _canonical_ref(
+                    self.target_recipe_ref,
+                    "target_recipe_ref",
+                    expected_artifact_type="target_recipe",
+                ),
+            )
+        except ValueError as error:
+            _fail("TARGET_RECIPE_INVALID", str(error))
+
+    @property
+    def payload(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "experiment_ref": self.experiment_ref,
+                "trial_declaration_ref": self.trial_declaration_ref,
+                "target_recipe_ref": self.target_recipe_ref,
+            }
+        )
+
+    @property
+    def ref(self) -> object:
+        return _local_ref("target_build_task", self.payload)
+
+
+@dataclass(frozen=True, slots=True)
+class TargetMaterializationEvidence:
+    target_build_task_ref: object
+    trial_declaration_ref: object
+    target_recipe_ref: object
+    materialization_request_hash: str
+    input_data_hash: str
+    target_stream_ref: object
+    target_stream_digest: str
+    event_count: int
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(
+                self,
+                "target_build_task_ref",
+                _canonical_ref(
+                    self.target_build_task_ref,
+                    "target_build_task_ref",
+                    expected_artifact_type="target_build_task",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "trial_declaration_ref",
+                _canonical_ref(
+                    self.trial_declaration_ref,
+                    "trial_declaration_ref",
+                    expected_artifact_type="trial_declaration",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "target_recipe_ref",
+                _canonical_ref(
+                    self.target_recipe_ref,
+                    "target_recipe_ref",
+                    expected_artifact_type="target_recipe",
+                ),
+            )
+            _content_hash(
+                self.materialization_request_hash,
+                "materialization_request_hash",
+            )
+            _content_hash(self.input_data_hash, "input_data_hash")
+            object.__setattr__(
+                self,
+                "target_stream_ref",
+                _canonical_target_stream_ref(
+                    self.target_stream_ref, "target_stream_ref"
+                ),
+            )
+            _content_hash(self.target_stream_digest, "target_stream_digest")
+            if type(self.event_count) is not int or self.event_count < 0:
+                raise ValueError("event_count must be a nonnegative integer")
+        except ValueError as error:
+            _fail("TARGET_MATERIALIZATION_INVALID", str(error))
+
+    @property
+    def payload(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "target_build_task_ref": self.target_build_task_ref,
+                "trial_declaration_ref": self.trial_declaration_ref,
+                "target_recipe_ref": self.target_recipe_ref,
+                "materialization_request_hash": self.materialization_request_hash,
+                "input_data_hash": self.input_data_hash,
+                "target_stream_ref": self.target_stream_ref,
+                "target_stream_digest": self.target_stream_digest,
+                "event_count": self.event_count,
+            }
+        )
+
+    @property
+    def ref(self) -> object:
+        return _local_ref("target_materialization_evidence", self.payload)
+
+
+TaskArtifact = (
+    TrialDeclaration
+    | AnalysisTask
+    | FeatureBuildTask
+    | ModelTrainingTask
+    | TargetBuildTask
+)
 _TASK_ARTIFACTS: Mapping[str, tuple[str, type]] = MappingProxyType(
     {
         "FEATURE_BUILD": ("feature_build_task", FeatureBuildTask),
         "MODEL_TRAINING": ("model_training_task", ModelTrainingTask),
+        "TARGET_BUILD": ("target_build_task", TargetBuildTask),
         "TRIAL": ("trial_declaration", TrialDeclaration),
         "ANALYSIS": ("analysis_task", AnalysisTask),
     }
@@ -1216,6 +1600,15 @@ def build_task_universe(experiment_spec: ExperimentSpec) -> tuple[TaskRef, ...]:
             TaskRef("FEATURE_BUILD", feature.ref, feature),
             TaskRef("MODEL_TRAINING", training.ref, training),
         )
+    elif experiment_spec.target_recipe_ref is not None:
+        target_tasks = tuple(
+            TargetBuildTask(experiment_spec.ref, trial.ref, experiment_spec.target_recipe_ref)
+            for trial in trials
+        )
+        build = tuple(
+            TaskRef("TARGET_BUILD", task.ref, task)
+            for task in sorted(target_tasks, key=lambda item: _canonical_json(item.ref))
+        )
     tasks = build + existing
     if len(tasks) != len(set(tasks)):
         _fail("TASK_AXIS_DUPLICATE")
@@ -1313,6 +1706,25 @@ class ModelBuildPublication:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetBuildPublication:
+    target_materialization_evidence_ref: object
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(
+                self,
+                "target_materialization_evidence_ref",
+                _canonical_ref(
+                    self.target_materialization_evidence_ref,
+                    "target_materialization_evidence_ref",
+                    expected_artifact_type="target_materialization_evidence",
+                ),
+            )
+        except ValueError as error:
+            _fail("TASK_OUTCOME_INVALID", str(error))
+
+
+@dataclass(frozen=True, slots=True)
 class BacktestTerminal:
     status: str
     durable_evidence_ref: object
@@ -1388,6 +1800,7 @@ Witness = (
     | AnalysisDerivation
     | FeatureDatasetPublication
     | ModelBuildPublication
+    | TargetBuildPublication
     | BacktestTerminal
     | UpstreamTaskOutcome
     | DependencyBlock
@@ -1430,6 +1843,18 @@ def _witness_payload(witness: Witness) -> Mapping[str, object]:
             {
                 "model_build_evidence": MappingProxyType(
                     {"model_build_evidence_ref": witness.model_build_evidence_ref}
+                )
+            }
+        )
+    if type(witness) is TargetBuildPublication:
+        return MappingProxyType(
+            {
+                "target_materialization_evidence": MappingProxyType(
+                    {
+                        "target_materialization_evidence_ref": (
+                            witness.target_materialization_evidence_ref
+                        )
+                    }
                 )
             }
         )
@@ -1476,6 +1901,7 @@ def _coerce_witness(value: object) -> Witness:
         AnalysisDerivation,
         FeatureDatasetPublication,
         ModelBuildPublication,
+        TargetBuildPublication,
         BacktestTerminal,
         UpstreamTaskOutcome,
         DependencyBlock,
@@ -1505,6 +1931,12 @@ def _coerce_witness(value: object) -> Witness:
             "model_build_evidence_ref"
         }:
             return ModelBuildPublication(payload["model_build_evidence_ref"])
+        if tag == "target_materialization_evidence" and set(payload) == {
+            "target_materialization_evidence_ref"
+        }:
+            return TargetBuildPublication(
+                payload["target_materialization_evidence_ref"]
+            )
         if tag == "backtest_terminal" and set(payload) == {
             "status",
             "durable_evidence_ref",
@@ -1550,6 +1982,13 @@ class TaskOutcome:
                 self.state == "COMPLETED" and type(witness) is ModelBuildPublication
             ) or (
                 self.state == "BLOCKED" and type(witness) is UpstreamTaskOutcome
+            ) or (self.state == "FAILED" and type(witness) is LocalFailure)
+        elif self.task_ref.kind == "TARGET_BUILD":
+            valid = (
+                self.state == "COMPLETED"
+                and type(witness) is TargetBuildPublication
+            ) or (
+                self.state == "BLOCKED" and type(witness) is DependencyBlock
             ) or (self.state == "FAILED" and type(witness) is LocalFailure)
         elif self.task_ref.kind == "TRIAL":
             valid = (
@@ -2524,6 +2963,7 @@ def _validate_outcome_links(
 ) -> None:
     feature: tuple[FeatureBuildTask, TaskOutcome] | None = None
     training: tuple[ModelTrainingTask, TaskOutcome] | None = None
+    targets: dict[str, tuple[TargetBuildTask, TaskOutcome]] = {}
     trials: dict[str, tuple[TaskRef, TaskOutcome]] = {}
     for task in universe:
         artifact = task.artifact
@@ -2535,6 +2975,13 @@ def _validate_outcome_links(
             if training is not None or type(artifact) is not ModelTrainingTask:
                 _fail("TASK_OUTCOME_INVALID")
             training = (artifact, outcomes[task])
+        elif task.kind == "TARGET_BUILD":
+            if type(artifact) is not TargetBuildTask:
+                _fail("TASK_OUTCOME_INVALID")
+            trial_wire = _canonical_json(artifact.trial_declaration_ref)
+            if trial_wire in targets:
+                _fail("TASK_OUTCOME_INVALID")
+            targets[trial_wire] = (artifact, outcomes[task])
         elif task.kind == "TRIAL":
             if type(artifact) is not TrialDeclaration:
                 _fail("TASK_OUTCOME_INVALID")
@@ -2560,15 +3007,21 @@ def _validate_outcome_links(
         elif training_outcome.state == "BLOCKED":
             _fail("TASK_OUTCOME_INVALID")
 
-    for _, trial_outcome in trials.values():
+    if targets and set(targets) != set(trials):
+        _fail("TASK_OUTCOME_INVALID")
+    for trial_wire, (_, trial_outcome) in trials.items():
+        upstream_outcome = training_outcome
+        if trial_wire in targets:
+            _, target_outcome = targets[trial_wire]
+            upstream_outcome = target_outcome
         if (
-            training_outcome is not None
-            and training_outcome.state != "COMPLETED"
+            upstream_outcome is not None
+            and upstream_outcome.state != "COMPLETED"
             and not (
                 trial_outcome.state == "BLOCKED"
                 and type(trial_outcome.witness) is UpstreamTaskOutcome
                 and _same_wire(
-                    trial_outcome.witness.task_outcome_ref, training_outcome.ref
+                    trial_outcome.witness.task_outcome_ref, upstream_outcome.ref
                 )
             )
         ):
@@ -3068,6 +3521,10 @@ __all__ = [
     "TaskAttemptStarted",
     "TaskOutcome",
     "TaskRef",
+    "TargetBuildPublication",
+    "TargetBuildTask",
+    "TargetMaterializationEvidence",
+    "TargetRecipe",
     "TrainerRecipe",
     "TrialCompletedPublication",
     "TrialDeclaration",
