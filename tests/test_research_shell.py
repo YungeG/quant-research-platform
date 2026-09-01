@@ -5,13 +5,14 @@ import importlib.util
 import json
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import crypto_quant_research.runtime as research_runtime
 import pytest
 from crypto_quant_domain import ArtifactEnvelope, canonical_bytes, canonical_sha256
 from crypto_quant_foundation import FoundationFailure, LocalFoundation
 from crypto_quant_research import (
+    DeferredTrialExecution,
     FrozenExperimentInputs,
     PublishedNoSelection,
     PublishedStrategyCandidate,
@@ -180,6 +181,79 @@ class DecisionGradePort(RecordingPort):
         return super().load_analysis_v2(ref)
 
 
+class _PreparedTrial:
+    def __init__(
+        self,
+        request: dict[str, object],
+        backtest_request_ref: dict[str, object],
+    ) -> None:
+        self.request = request
+        self.backtest_request_ref = backtest_request_ref
+
+
+class DeferredPort:
+    def __init__(
+        self,
+        foundation: LocalFoundation,
+        events: list[str] | None = None,
+        *,
+        preparation_failures: int = 0,
+        run_failures: int = 0,
+        request_ids: tuple[str, ...] = ("deferred-request",),
+    ) -> None:
+        self._port = DecisionGradePort(foundation)
+        self._events = events if events is not None else []
+        self._preparation_failures = preparation_failures
+        self._run_failures = run_failures
+        self._request_ids = request_ids
+        self.prepare_calls = 0
+        self.run_prepared_calls = 0
+
+    def prepare(
+        self, request_spec: dict[str, object], *, experiment_id: str
+    ) -> _PreparedTrial:
+        self._events.append("prepare")
+        self.prepare_calls += 1
+        if self._preparation_failures:
+            self._preparation_failures -= 1
+            raise RuntimeError("preparation failed")
+        request_id = self._request_ids[min(self.prepare_calls - 1, len(self._request_ids) - 1)]
+        return _PreparedTrial(
+            {**deepcopy(request_spec), "experiment_id": experiment_id},
+            {"type": "backtest_request_ref", "id": request_id},
+        )
+
+    def run_prepared(self, prepared: _PreparedTrial) -> dict[str, object]:
+        self._events.append("run")
+        self.run_prepared_calls += 1
+        if self._run_failures:
+            self._run_failures -= 1
+            raise RuntimeError("run failed")
+        return self._port.run(prepared.request)
+
+    def derive(
+        self,
+        completed_ref: dict[str, object],
+        metric_profile_ref: dict[str, object],
+    ) -> dict[str, object]:
+        return self._port.derive(completed_ref, metric_profile_ref)
+
+    def load_completed(self, ref: dict[str, object]) -> dict[str, object]:
+        return self._port.load_completed(ref)
+
+    def load_completed_v3(self, ref: dict[str, object]) -> dict[str, object]:
+        return self._port.load_completed_v3(ref)
+
+    def load_terminal(self, ref: dict[str, object]) -> dict[str, object]:
+        return self._port.load_terminal(ref)
+
+    def load_analysis(self, ref: dict[str, object]) -> dict[str, object]:
+        return self._port.load_analysis(ref)
+
+    def load_analysis_v2(self, ref: dict[str, object]) -> dict[str, object]:
+        return self._port.load_analysis_v2(ref)
+
+
 def _inputs(
     *,
     terminal_case: str = "terminal_blocked",
@@ -255,6 +329,35 @@ def _decision_grade_inputs() -> FrozenExperimentInputs:
     )
 
 
+def _deferred_decision_grade_inputs(
+    *, max_attempts: int = 1
+) -> FrozenExperimentInputs:
+    immediate = _decision_grade_inputs()
+    execution = immediate.trial_executions[0]
+    return FrozenExperimentInputs(
+        immediate.experiment_spec,
+        immediate.selection_policy,
+        immediate.selection_declared_by_ref,
+        (
+            DeferredTrialExecution(
+                execution.trial_declaration_ref,
+                execution.request_spec,
+                execution.resolved_model_refs,
+            ),
+        ),
+        immediate.reservation_at,
+        max_attempts,
+    )
+
+
+def _trial_specs(foundation: LocalFoundation) -> list[dict[str, object]]:
+    return [
+        cast(dict[str, object], envelope["payload"])
+        for envelope in _log_payloads(foundation, ARTIFACT_LOG)
+        if envelope["artifact_type"] == "backtest_trial_spec"
+    ]
+
+
 def _payload(foundation: LocalFoundation, ref: object) -> dict[str, object]:
     return json.loads(foundation.read(ref=ref).source_bytes)["payload"]
 
@@ -275,6 +378,166 @@ def _runtime(tmp_path: Path) -> tuple[LocalFoundation, SampleConsumptionLedger, 
     foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
     ledger = SampleConsumptionLedger(foundation)
     return foundation, ledger, RecordingPort(foundation, _contract())
+
+
+def test_deferred_trial_orders_reservation_prepare_spec_and_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    events: list[str] = []
+    port = DeferredPort(foundation, events)
+    reserve = ledger.reserve
+    append = foundation.append
+
+    def observable_reserve(record: Any, producer_ref: Any):
+        result = reserve(record, producer_ref)
+        if getattr(producer_ref, "artifact_type", None) == "trial_declaration":
+            events.append("reserve")
+        return result
+
+    def observable_append(log_name: str, event_id: str, payload: bytes):
+        receipt = append(log_name, event_id, payload)
+        envelope = json.loads(payload)
+        if envelope["artifact_type"] == "backtest_trial_spec":
+            events.append("trial-spec")
+        return receipt
+
+    monkeypatch.setattr(ledger, "reserve", observable_reserve)
+    monkeypatch.setattr(foundation, "append", observable_append)
+
+    result = execute_experiment(
+        _deferred_decision_grade_inputs(), foundation, ledger, port
+    )
+
+    assert type(result) is PublishedStrategyCandidate
+    assert events[:4] == ["reserve", "prepare", "trial-spec", "run"]
+    assert len(_trial_specs(foundation)) == 1
+    assert not hasattr(port, "run")
+
+
+def test_deferred_reservation_rejection_has_zero_downstream_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DeferredPort(foundation)
+    reserve = ledger.reserve
+
+    def reject_trial(record: Any, producer_ref: Any):
+        if getattr(producer_ref, "artifact_type", None) == "trial_declaration":
+            raise FoundationFailure("WRITE_LOCK_UNAVAILABLE")
+        return reserve(record, producer_ref)
+
+    monkeypatch.setattr(ledger, "reserve", reject_trial)
+    execute_experiment(_deferred_decision_grade_inputs(), foundation, ledger, port)
+
+    assert port.prepare_calls == 0
+    assert port.run_prepared_calls == 0
+    assert _trial_specs(foundation) == []
+
+
+def test_deferred_preparation_failure_retries_without_a_trial_spec(tmp_path: Path) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DeferredPort(foundation, preparation_failures=2)
+
+    execute_experiment(
+        _deferred_decision_grade_inputs(max_attempts=2), foundation, ledger, port
+    )
+
+    assert port.prepare_calls == 2
+    assert port.run_prepared_calls == 0
+    assert _trial_specs(foundation) == []
+
+
+def test_deferred_replay_recovers_spec_without_second_prepare_or_run(
+    tmp_path: Path,
+) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DeferredPort(foundation)
+    inputs = _deferred_decision_grade_inputs()
+
+    first = execute_experiment(inputs, foundation, ledger, port)
+    second = execute_experiment(inputs, foundation, ledger, port)
+
+    assert second == first
+    assert port.prepare_calls == 1
+    assert port.run_prepared_calls == 1
+    assert len(_trial_specs(foundation)) == 1
+
+
+def test_deferred_retry_accepts_the_same_request_ref(tmp_path: Path) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DeferredPort(foundation, run_failures=1)
+
+    result = execute_experiment(
+        _deferred_decision_grade_inputs(max_attempts=2), foundation, ledger, port
+    )
+
+    assert type(result) is PublishedStrategyCandidate
+    assert port.prepare_calls == 2
+    assert port.run_prepared_calls == 2
+    assert len(_trial_specs(foundation)) == 1
+
+
+def test_deferred_retry_rejects_a_changed_request_ref_before_second_run(
+    tmp_path: Path,
+) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: RECEIVED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DeferredPort(
+        foundation,
+        run_failures=1,
+        request_ids=("first-request", "changed-request"),
+    )
+
+    execute_experiment(
+        _deferred_decision_grade_inputs(max_attempts=2), foundation, ledger, port
+    )
+
+    assert port.prepare_calls == 2
+    assert port.run_prepared_calls == 1
+    assert len(_trial_specs(foundation)) == 1
+    failed = [
+        item
+        for item in _outcomes(foundation)
+        if item["task_ref"]["kind"] == "TRIAL" and item["state"] == "FAILED"
+    ]
+    assert failed[0]["witness"] == {
+        "local_failure": {"failure_code": "MODEL_BINDING_INVALID"}
+    }
+
+
+def test_frozen_inputs_reject_mixed_and_duplicate_deferred_requests() -> None:
+    assert set(DeferredTrialExecution.__dataclass_fields__) == {
+        "trial_declaration_ref",
+        "request_spec",
+        "resolved_model_refs",
+    }
+    immediate = _inputs()
+    deferred = tuple(
+        DeferredTrialExecution(item.trial_declaration_ref, {"same": "request"})
+        for item in immediate.trial_executions
+    )
+    with pytest.raises(ValueError, match="TRIAL_REQUEST_COLLISION"):
+        FrozenExperimentInputs(
+            immediate.experiment_spec,
+            immediate.selection_policy,
+            immediate.selection_declared_by_ref,
+            deferred,
+            immediate.reservation_at,
+        )
+    with pytest.raises(TypeError, match="homogeneous exact tuple"):
+        FrozenExperimentInputs(
+            immediate.experiment_spec,
+            immediate.selection_policy,
+            immediate.selection_declared_by_ref,
+            (immediate.trial_executions[0], *deferred[1:]),
+            immediate.reservation_at,
+        )
 
 
 def test_fixture_shell_publishes_exact_closure_and_replays_without_a_second_run(

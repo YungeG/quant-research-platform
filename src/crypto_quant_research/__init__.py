@@ -21,6 +21,7 @@ from .integration import (
 
 _RUNTIME_EXPORTS = frozenset(
     {
+        "DeferredTrialExecution",
         "FrozenExperimentInputs",
         "FrozenModelExperimentInputs",
         "PublishedNoSelection",
@@ -41,6 +42,7 @@ def __getattr__(name: str):
 __all__ = [
     "CampaignScope",
     "DataSlice",
+    "DeferredTrialExecution",  # pyright: ignore[reportUnsupportedDunderAll]
     "FeatureBuildTask",
     "FeatureDatasetManifest",
     "FeatureRecipe",

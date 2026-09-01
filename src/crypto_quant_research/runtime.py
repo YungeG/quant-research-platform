@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from crypto_quant_domain import (
     ArtifactEnvelope,
@@ -162,11 +162,14 @@ def _failure_code(error: Exception) -> str:
     return value if type(value) is str and value else "BACKTEST_OPERATION_FAILED"
 
 
-def _require_backtest(backtest: object) -> None:
-    if not all(
-        callable(getattr(backtest, name, None))
-        for name in ("run", "derive", "load_completed", "load_terminal", "load_analysis")
-    ):
+def _require_backtest(backtest: object, *, deferred: bool = False) -> None:
+    operations = (
+        "derive",
+        "load_completed",
+        "load_terminal",
+        "load_analysis",
+    ) + (("prepare", "run_prepared") if deferred else ("run",))
+    if not all(callable(getattr(backtest, name, None)) for name in operations):
         raise TypeError("backtest must expose the frozen BT-PORT operations")
 
 
@@ -231,11 +234,35 @@ class TrialExecution:
 
 
 @dataclass(frozen=True, slots=True)
+class DeferredTrialExecution:
+    """One opaque request whose Backtest request ref is assigned after reservation."""
+
+    trial_declaration_ref: object
+    request_spec: dict[str, object]
+    resolved_model_refs: tuple[object, ...] = ()
+
+    def __post_init__(self) -> None:
+        trial_ref = _plain(self.trial_declaration_ref)
+        request = _plain(self.request_spec)
+        if type(trial_ref) is not str or type(request) is not dict:
+            raise ValueError("deferred trial execution must contain canonical opaque references")
+        if type(self.resolved_model_refs) is not tuple:
+            raise ValueError("resolved_model_refs must be a tuple")
+        object.__setattr__(self, "trial_declaration_ref", trial_ref)
+        object.__setattr__(self, "request_spec", request)
+        object.__setattr__(
+            self,
+            "resolved_model_refs",
+            tuple(_plain(ref) for ref in self.resolved_model_refs),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FrozenExperimentInputs:
     experiment_spec: ExperimentSpec
     selection_policy: SelectionPolicy
     selection_declared_by_ref: object
-    trial_executions: tuple[TrialExecution, ...]
+    trial_executions: tuple[TrialExecution, ...] | tuple[DeferredTrialExecution, ...]
     reservation_at: str
     max_attempts: int = 1
 
@@ -244,10 +271,15 @@ class FrozenExperimentInputs:
             raise TypeError("experiment_spec must be an ExperimentSpec")
         if type(self.selection_policy) is not SelectionPolicy:
             raise TypeError("selection_policy must be a SelectionPolicy")
-        if type(self.trial_executions) is not tuple or any(
-            type(item) is not TrialExecution for item in self.trial_executions
+        if (
+            type(self.trial_executions) is not tuple
+            or not self.trial_executions
+            or len({type(item) for item in self.trial_executions}) != 1
+            or type(self.trial_executions[0]) not in {TrialExecution, DeferredTrialExecution}
         ):
-            raise TypeError("trial_executions must be a tuple of TrialExecution")
+            raise TypeError(
+                "trial_executions must be a homogeneous exact tuple of trial executions"
+            )
         if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
         object.__setattr__(self, "selection_declared_by_ref", _plain(self.selection_declared_by_ref))
@@ -257,7 +289,11 @@ class FrozenExperimentInputs:
         supplied = tuple(item.trial_declaration_ref for item in self.trial_executions)
         if len(supplied) != len(expected) or set(supplied) != expected:
             raise ResearchCoreError("TASK_REF_FOREIGN")
-        if len({_wire(item.backtest_request_ref) for item in self.trial_executions}) != len(supplied):
+        if type(self.trial_executions[0]) is TrialExecution:
+            immediate = cast(tuple[TrialExecution, ...], self.trial_executions)
+            if len({_wire(item.backtest_request_ref) for item in immediate}) != len(supplied):
+                raise ValueError("TRIAL_REQUEST_COLLISION")
+        elif len({_wire(item.request_spec) for item in self.trial_executions}) != len(supplied):
             raise ValueError("TRIAL_REQUEST_COLLISION")
         if not any(
             _wire(self.selection_policy.metric_profile_ref) == _wire(profile_ref)
@@ -365,6 +401,7 @@ class _PublishedBase:
     selection_ref: ArtifactRef
     selection_ledger_sequence: int
     trial_specs: dict[str, ArtifactRef]
+    trial_request_refs: dict[str, dict[str, object]]
     model_build_evidence_ref: ArtifactRef | None = None
 
     @property
@@ -384,15 +421,26 @@ class _RecoveredExecution:
 def _normal_inputs(value: object) -> FrozenExperimentInputs:
     if type(value) is not FrozenExperimentInputs:
         raise TypeError("frozen_inputs must be FrozenExperimentInputs")
-    executions = tuple(
-        TrialExecution(
-            item.trial_declaration_ref,
-            item.request_spec,
-            item.backtest_request_ref,
-            item.resolved_model_refs,
+    if type(value.trial_executions[0]) is TrialExecution:
+        immediate = cast(tuple[TrialExecution, ...], value.trial_executions)
+        executions = tuple(
+            TrialExecution(
+                item.trial_declaration_ref,
+                item.request_spec,
+                item.backtest_request_ref,
+                item.resolved_model_refs,
+            )
+            for item in immediate
         )
-        for item in value.trial_executions
-    )
+    else:
+        executions = tuple(
+            DeferredTrialExecution(
+                item.trial_declaration_ref,
+                item.request_spec,
+                item.resolved_model_refs,
+            )
+            for item in value.trial_executions
+        )
     return FrozenExperimentInputs(
         value.experiment_spec,
         value.selection_policy,
@@ -515,12 +563,87 @@ def _publish_base(
         selection_ref,
         selection_receipt.ledger_sequence,
         {},
+        {},
     )
     if publish_trial_specs:
-        if type(inputs) is not FrozenExperimentInputs:
-            raise TypeError("trial specs require FrozenExperimentInputs")
-        _publish_trial_specs(base, foundation, inputs.trial_executions)
+        if (
+            type(inputs) is not FrozenExperimentInputs
+            or type(inputs.trial_executions[0]) is not TrialExecution
+        ):
+            raise TypeError("trial specs require immediate TrialExecution inputs")
+        _publish_trial_specs(
+            base,
+            foundation,
+            cast(tuple[TrialExecution, ...], inputs.trial_executions),
+        )
     return base
+
+
+def _trial_spec_payload(
+    base: _PublishedBase,
+    trial_ref: str,
+    resolved_model_refs: tuple[object, ...],
+    backtest_request_ref: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "trial_declaration_ref": _ref_payload(base.refs[trial_ref]),
+        "resolved_model_refs": list(resolved_model_refs),
+        "backtest_request_ref": backtest_request_ref,
+    }
+
+
+def _remember_trial_spec(
+    base: _PublishedBase,
+    trial_ref: str,
+    ref: ArtifactRef,
+    request_ref: dict[str, object],
+) -> None:
+    existing_ref = base.trial_specs.get(trial_ref)
+    existing_request = base.trial_request_refs.get(trial_ref)
+    if (
+        (existing_ref is not None and existing_ref != ref)
+        or (existing_request is not None and existing_request != request_ref)
+        or any(
+            owner != trial_ref and _wire(value) == _wire(request_ref)
+            for owner, value in base.trial_request_refs.items()
+        )
+    ):
+        raise ResearchCoreError("MODEL_BINDING_INVALID")
+    base.trial_specs[trial_ref] = ref
+    base.trial_request_refs[trial_ref] = request_ref
+
+
+def _publish_trial_spec(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+    trial_ref: str,
+    resolved_model_refs: tuple[object, ...],
+    backtest_request_ref: object,
+) -> None:
+    request_ref = _plain(backtest_request_ref)
+    if type(request_ref) is not dict:
+        raise TypeError("backtest_request_ref must be an exact mapping")
+    payload = _trial_spec_payload(
+        base, trial_ref, resolved_model_refs, request_ref
+    )
+    expected = ArtifactRef.from_envelope(
+        ArtifactEnvelope.create("backtest_trial_spec", 1, payload)
+    )
+    existing = base.trial_specs.get(trial_ref)
+    if existing is not None:
+        if existing != expected:
+            raise ResearchCoreError("MODEL_BINDING_INVALID")
+        _remember_trial_spec(base, trial_ref, existing, request_ref)
+        return
+    ref, _ = _publish(
+        foundation,
+        _RESEARCH_ARTIFACTS_LOG,
+        "backtest_trial_spec",
+        payload,
+    )
+    if ref != expected:
+        raise ResearchCoreError("MODEL_BINDING_INVALID")
+    _remember_trial_spec(base, trial_ref, ref, request_ref)
 
 
 def _publish_trial_specs(
@@ -528,22 +651,66 @@ def _publish_trial_specs(
     foundation: LocalFoundation,
     executions: tuple[TrialExecution, ...],
 ) -> None:
-    by_trial = {item.trial_declaration_ref: item for item in executions}
+    by_trial = {
+        cast(str, item.trial_declaration_ref): item for item in executions
+    }
     if set(by_trial) != {trial.ref for trial in base.trials}:
         raise ResearchCoreError("TASK_REF_FOREIGN")
     for trial in base.trials:
-        execution = by_trial[trial.ref]
-        ref, _ = _publish(
+        execution = by_trial[cast(str, trial.ref)]
+        _publish_trial_spec(
+            base,
             foundation,
-            _RESEARCH_ARTIFACTS_LOG,
-            "backtest_trial_spec",
-            {
-                "trial_declaration_ref": _ref_payload(base.refs[trial.ref]),
-                "resolved_model_refs": list(execution.resolved_model_refs),
-                "backtest_request_ref": execution.backtest_request_ref,
-            },
+            cast(str, trial.ref),
+            execution.resolved_model_refs,
+            execution.backtest_request_ref,
         )
-        base.trial_specs[trial.ref] = ref
+
+
+def _recover_trial_specs(
+    base: _PublishedBase,
+    foundation: LocalFoundation,
+) -> None:
+    if type(base.inputs) is not FrozenExperimentInputs:
+        return
+    executions = {
+        cast(str, item.trial_declaration_ref): item
+        for item in base.inputs.trial_executions
+    }
+    trial_ref_by_wire = {
+        _wire(_ref_payload(base.refs[cast(str, trial.ref)])): cast(str, trial.ref)
+        for trial in base.trials
+    }
+    for _, ref, payload in _published_entries(foundation, _RESEARCH_ARTIFACTS_LOG):
+        if ref.artifact_type != "backtest_trial_spec":
+            continue
+        trial_ref = trial_ref_by_wire.get(_wire(payload.get("trial_declaration_ref")))
+        if trial_ref is None:
+            continue
+        execution = executions[trial_ref]
+        request_ref = payload.get("backtest_request_ref")
+        if (
+            set(payload)
+            != {
+                "trial_declaration_ref",
+                "resolved_model_refs",
+                "backtest_request_ref",
+            }
+            or payload.get("resolved_model_refs")
+            != list(execution.resolved_model_refs)
+            or type(request_ref) is not dict
+            or (
+                type(execution) is TrialExecution
+                and request_ref != execution.backtest_request_ref
+            )
+        ):
+            raise ResearchCoreError("MODEL_BINDING_INVALID")
+        expected = ArtifactRef.from_envelope(
+            ArtifactEnvelope.create("backtest_trial_spec", 1, payload)
+        )
+        if ref != expected:
+            raise ResearchCoreError("MODEL_BINDING_INVALID")
+        _remember_trial_spec(base, trial_ref, ref, request_ref)
 
 
 def _recover_model_publications(
@@ -732,6 +899,17 @@ def _trial_observation(
     run_ref = backtest.run(request)
     if _is_terminal_ref(run_ref):
         return backtest.load_terminal(run_ref)
+    return _load_completed(backtest, run_ref)
+
+
+def _prepared_trial_observation(
+    backtest: object,
+    prepared: object,
+) -> Mapping[str, object]:
+    port = cast(Any, backtest)
+    run_ref = port.run_prepared(prepared)
+    if _is_terminal_ref(run_ref):
+        return port.load_terminal(run_ref)
     return _load_completed(backtest, run_ref)
 
 
@@ -1356,9 +1534,33 @@ def _execute_new(
                 )
             else:
                 try:
-                    record = _trial_observation(
-                        backtest, execution.request_spec, base.refs[trial.ref]
-                    )
+                    if type(execution) is DeferredTrialExecution:
+                        deferred_backtest = cast(Any, backtest)
+                        prepared = deferred_backtest.prepare(
+                            execution.request_spec,
+                            experiment_id=canonical_bytes(
+                                base.refs[trial.ref]
+                            ).decode("utf-8"),
+                        )
+                        request_ref = getattr(
+                            prepared, "backtest_request_ref", None
+                        )
+                        if type(request_ref) is not dict:
+                            raise TypeError(
+                                "prepared.backtest_request_ref must be an exact mapping"
+                            )
+                        _publish_trial_spec(
+                            base,
+                            foundation,
+                            cast(str, trial.ref),
+                            execution.resolved_model_refs,
+                            request_ref,
+                        )
+                        record = _prepared_trial_observation(backtest, prepared)
+                    else:
+                        record = _trial_observation(
+                            backtest, execution.request_spec, base.refs[trial.ref]
+                        )
                     outcome = map_backtest_observation(task, record)
                     if outcome.state == "COMPLETED":
                         completed_records[trial.ref] = record
@@ -1741,8 +1943,10 @@ def execute_experiment(
         raise TypeError("foundation must be a LocalFoundation")
     if type(sample_ledger) is not SampleConsumptionLedger:
         raise TypeError("sample_ledger must be a SampleConsumptionLedger")
-    _require_backtest(backtest)
-    base = _publish_base(inputs, foundation)
+    deferred = type(inputs.trial_executions[0]) is DeferredTrialExecution
+    _require_backtest(backtest, deferred=deferred)
+    base = _publish_base(inputs, foundation, publish_trial_specs=not deferred)
+    _recover_trial_specs(base, foundation)
     existing = _replay_existing(base, foundation, sample_ledger, backtest)
     if existing is not None:
         return existing
@@ -1750,6 +1954,7 @@ def execute_experiment(
 
 
 __all__ = [
+    "DeferredTrialExecution",
     "FrozenExperimentInputs",
     "FrozenModelExperimentInputs",
     "PublishedNoSelection",
