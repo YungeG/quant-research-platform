@@ -3,6 +3,7 @@ name = "crypto-quant-research"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+  "crypto-quant-bundle-builder==0.1.0",
   "crypto-quant-domain==0.1.0",
   "crypto-quant-foundation==0.1.0",
   "crypto-quant-validation==0.1.0",

@@ -7,6 +7,14 @@ from .declarations import (
     TrialDeclaration,
     compile_trial_declarations,
 )
+from .raw_blob_snapshots import (
+    RAW_BLOB_SNAPSHOTS_LOG,
+    RawBlobSnapshotFoundation,
+    RawBlobSnapshotPublication,
+    RawBlobSnapshotPublicationFact,
+    open_verified_raw_blob_snapshot,
+    publish_raw_blob_snapshot,
+)
 from .integration import (
     DataSlice,
     DataSlice as IntegratedDataSlice,
@@ -49,6 +57,10 @@ def __getattr__(name: str):
 
 __all__ = [
     "CampaignScope",
+    "RAW_BLOB_SNAPSHOTS_LOG",
+    "RawBlobSnapshotFoundation",
+    "RawBlobSnapshotPublication",
+    "RawBlobSnapshotPublicationFact",
     "DataSlice",
     "DeferredTrialExecution",  # pyright: ignore[reportUnsupportedDunderAll]
     "FeatureBuildTask",
@@ -77,5 +89,7 @@ __all__ = [
     "compile_trial_declarations",
     "execute_experiment",
     "execute_model_experiment",
+    "open_verified_raw_blob_snapshot",
+    "publish_raw_blob_snapshot",
     "validate_model_build",
 ]
