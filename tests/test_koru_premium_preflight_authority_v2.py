@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -45,7 +47,6 @@ from crypto_quant_market_data import (
     MarketBundleManifest,
     MarketStreamManifest,
 )
-
 from crypto_quant_research import (
     KORU_PREMIUM_ECONOMICS_V4_LOG,
     KORU_PREMIUM_OVERLAY_SET_V4_LOG,
@@ -59,6 +60,13 @@ from crypto_quant_research import (
 from crypto_quant_research import (
     koru_premium_preflight_authority_v2 as authority_module,
 )
+
+CONSUMER_SCRIPT = ROOT / "research/koruusdt/run_public_koru_retained_preflight.py"
+CONSUMER_SPEC = importlib.util.spec_from_file_location("koru_v2_authority_consumer", CONSUMER_SCRIPT)
+assert CONSUMER_SPEC is not None and CONSUMER_SPEC.loader is not None
+consumer_runner = importlib.util.module_from_spec(CONSUMER_SPEC)
+sys.modules[CONSUMER_SPEC.name] = consumer_runner
+CONSUMER_SPEC.loader.exec_module(consumer_runner)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_koru_source_projection_publication_v3 as source_publication
@@ -132,6 +140,167 @@ def _published(tmp_path: Path):
         economics=economics_outcome.result, reader_set=reader_outcome.result,
     )
     return foundation, publication, tmp_path
+
+
+def _consumer_locator(publication) -> dict[str, object]:
+    return {
+        "type": consumer_runner.PREMIUM_PREFLIGHT_AUTHORITY_V2_LOCATOR_SCHEMA,
+        "schema_version": 1,
+        "authority_ref": publication.authority_ref.to_canonical_dict(),
+        "publication_entry_ref": {
+            "log_name": publication.publication_entry_ref.log_name,
+            "log_sequence": publication.publication_entry_ref.log_sequence,
+            "receipt_hash": publication.publication_entry_ref.receipt_hash,
+        },
+    }
+
+
+def _consume_published_v2(tmp_path: Path, foundation: LocalFoundation, publication, root: Path):
+    receipt_root = tmp_path / "consumer-receipts"
+    receipt_root.mkdir()
+    locator = _consumer_locator(publication)
+    return consumer_runner.consume_published_koru_premium_preflight_authority_v2(
+        locator=locator,
+        foundation_root=foundation._root,
+        repository_root=root / "overlays",
+        receipt_root=receipt_root,
+    ), locator, receipt_root
+
+
+def test_offline_v2_authority_consumer_writes_exact_readback_verified_receipt(tmp_path: Path) -> None:
+    foundation, publication, root = _published(tmp_path)
+
+    receipt, locator, receipt_root = _consume_published_v2(tmp_path, foundation, publication, root)
+
+    final = receipt["final_authority"]
+    assert receipt["outcome"] == "success"
+    assert receipt["launch_gate"] == "GO_FOR_SEPARATE_EXPERIMENT_LAUNCH_REVIEW"
+    assert receipt["network_performed"] is False
+    assert receipt["holdout_touched"] is False
+    assert receipt["upstream_producer_work_performed"] is False
+    assert receipt["verification_replay_performed"] is True
+    assert len(final) == 1
+    assert final[0]["authority_ref"] == locator["authority_ref"]
+    assert final[0]["publication_entry_ref"] == locator["publication_entry_ref"]
+    assert canonical_bytes(final[0]["full_spine"]) == canonical_bytes(publication.authority.to_canonical_dict())
+    assert final[0]["full_spine_sha256"] == canonical_sha256(final[0]["full_spine"])
+    assert final[0]["premium_reader_ids"] == ["KORU-PRM-01", "KORU-PRM-02", "KORU-PRM-03", "KORU-PRM-04"]
+    assert final[0]["reader_set_digest"] == publication.authority.reader_set.reader_set.reader_set_digest
+    assert str(foundation._root) not in json.dumps(receipt)
+    assert str(root / "overlays") not in json.dumps(receipt)
+    assert str(receipt_root) not in json.dumps(receipt)
+    expected = receipt_root / "receipts" / f"{canonical_sha256(locator).removeprefix('sha256:')}.json"
+    assert json.loads(expected.read_text()) == receipt
+
+
+@pytest.mark.parametrize("tamper", ("ref", "owner-log", "repository"))
+def test_v2_authority_consumer_fails_before_legacy_producer_or_child_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+) -> None:
+    foundation, publication, root = _published(tmp_path)
+    locator = _consumer_locator(publication)
+    repository_root = root / "overlays"
+    if tamper == "ref":
+        locator["authority_ref"] = {**locator["authority_ref"], "content_hash": "sha256:" + "0" * 64}
+    elif tamper == "owner-log":
+        locator["publication_entry_ref"] = {**locator["publication_entry_ref"], "receipt_hash": "sha256:" + "0" * 64}
+    else:
+        repository_root = tmp_path / "replacement-repository"
+        repository_root.mkdir()
+    receipt_root = tmp_path / f"consumer-receipts-{tamper}"
+    receipt_root.mkdir()
+    monkeypatch.setattr(consumer_runner, "full_preflight", lambda *_args, **_kwargs: pytest.fail("legacy full mode must not run"))
+    monkeypatch.setattr(consumer_runner, "build_source", lambda *_args, **_kwargs: pytest.fail("source build must not run"))
+    monkeypatch.setattr(consumer_runner, "publish_koru_source_projection_authority", lambda *_args, **_kwargs: pytest.fail("source publication must not run"))
+    monkeypatch.setattr(consumer_runner.subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("child must not start"))
+
+    receipt = consumer_runner.consume_published_koru_premium_preflight_authority_v2(
+        locator=locator,
+        foundation_root=foundation._root,
+        repository_root=repository_root,
+        receipt_root=receipt_root,
+    )
+
+    assert receipt["outcome"] == "non_success"
+    assert receipt["failure_stage"] == "authority_spine_verification"
+    assert receipt["launch_gate"] == "NO_GO"
+    assert receipt["final_authority"] == []
+
+
+def test_v2_authority_consumer_validates_locator_before_operational_roots(tmp_path: Path) -> None:
+    receipt_root = tmp_path / "consumer-receipts"
+    receipt_root.mkdir()
+
+    with pytest.raises(ValueError, match="locator"):
+        consumer_runner.consume_published_koru_premium_preflight_authority_v2(
+            locator={}, foundation_root=Path("relative"), repository_root=Path("relative"), receipt_root=receipt_root,
+        )
+    locator = {
+        "type": consumer_runner.PREMIUM_PREFLIGHT_AUTHORITY_V2_LOCATOR_SCHEMA,
+        "schema_version": 1,
+        "authority_ref": {
+            "type": "artifact_ref", "artifact_type": "koru_premium_preflight_authority_v2",
+            "schema_version": 2, "content_hash": "sha256:" + "0" * 64,
+        },
+        "publication_entry_ref": {
+            "log_name": KORU_PREMIUM_PREFLIGHT_AUTHORITY_V2_LOG,
+            "log_sequence": 1, "receipt_hash": "sha256:" + "0" * 64,
+        },
+    }
+    with pytest.raises(ValueError, match="Foundation root"):
+        consumer_runner.consume_published_koru_premium_preflight_authority_v2(
+            locator=locator, foundation_root=Path("relative"), repository_root=Path("relative"), receipt_root=receipt_root,
+        )
+    assert not (receipt_root / "receipts").exists()
+
+
+def test_v2_authority_consumer_returns_existing_exact_locator_receipt_without_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation, publication, root = _published(tmp_path)
+    first, locator, receipt_root = _consume_published_v2(tmp_path, foundation, publication, root)
+    monkeypatch.setattr(
+        consumer_runner, "open_published_koru_premium_preflight_authority_v2",
+        lambda **_kwargs: pytest.fail("existing receipt must be returned before reopen"),
+    )
+
+    second = consumer_runner.consume_published_koru_premium_preflight_authority_v2(
+        locator=locator,
+        foundation_root=foundation._root,
+        repository_root=root / "overlays",
+        receipt_root=receipt_root,
+    )
+
+    assert second == first
+
+
+def test_v2_authority_consumer_cli_branch_and_helper_exclude_legacy_execution() -> None:
+    source = CONSUMER_SCRIPT.read_text(encoding="utf-8")
+    helper = inspect.getsource(consumer_runner.consume_published_koru_premium_preflight_authority_v2)
+    branch = source[
+        source.index("elif args.consume_published_preflight_authority_v2:"):
+        source.index("elif args.full:")
+    ]
+
+    assert "--consume-published-preflight-authority-v2" in source
+    assert "consume_published_koru_premium_preflight_authority_v2" in branch
+    for forbidden in ("full_preflight", "build_source", "publish_", "Popen", "Runtime", "Backtest", "Experiment", "Holdout"):
+        assert forbidden not in helper
+        assert forbidden not in branch
+
+
+def test_v2_authority_consumer_cli_uses_the_new_mode(tmp_path: Path) -> None:
+    foundation, publication, root = _published(tmp_path)
+    receipt_root = tmp_path / "consumer-receipts"
+    receipt_root.mkdir()
+
+    assert consumer_runner.main([
+        "--consume-published-preflight-authority-v2",
+        "--preflight-authority-v2-locator", json.dumps(_consumer_locator(publication)),
+        "--preflight-authority-v2-foundation-root", str(foundation._root),
+        "--preflight-authority-v2-repository-root", str(root / "overlays"),
+        "--preflight-authority-v2-receipt-root", str(receipt_root),
+    ]) == 0
 
 
 def _opened_source(foundation: LocalFoundation, authority):
