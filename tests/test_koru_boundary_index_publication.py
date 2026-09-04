@@ -23,14 +23,11 @@ from crypto_quant_bundle_builder import (
 from crypto_quant_bundle_builder import (
     binance_usdm_koru_aggtrade_boundary_index_v1 as boundary_index,
 )
+from crypto_quant_bundle_builder.binance_usdm_koru_aggtrades_source_bounded_v1 import (
+    _RETAINED_AVAILABILITY_AUTHORITY_MEMBER_KEY,
+)
 from crypto_quant_domain import ArtifactEnvelope, UtcInstant
 from crypto_quant_foundation import LocalFoundation
-from crypto_quant_research import (
-    BOUNDARY_INDEXES_LOG,
-    open_published_koru_aggregate_trade_boundary_index_authority_v3,
-    publish_koru_aggregate_trade_boundary_index_authority_v3,
-    publish_raw_blob_snapshot,
-)
 from tests.bundle_builder.providers.binance_usdm.test_koru_aggtrade_boundary_index_v1 import (
     DAY_NS,
     day_start_ns,
@@ -46,6 +43,13 @@ from tests.bundle_builder.providers.binance_usdm.test_koru_aggtrades_retained_re
 )
 from tests.bundle_builder.providers.binance_usdm.test_koru_aggtrades_retained_rest_v1 import (
     request_for as retained_request_for,
+)
+
+from crypto_quant_research import (
+    BOUNDARY_INDEXES_LOG,
+    open_published_koru_aggregate_trade_boundary_index_authority_v3,
+    publish_koru_aggregate_trade_boundary_index_authority_v3,
+    publish_raw_blob_snapshot,
 )
 
 
@@ -208,6 +212,10 @@ def test_two_capture_retained_pages_are_bound_without_aggregate_replay(tmp_path:
             )
             for ordinal, capture in enumerate((official, retained), start=1)
             for member in capture.snapshot.members
+            if not (
+                capture is retained
+                and member.member_key == _RETAINED_AVAILABILITY_AUTHORITY_MEMBER_KEY
+            )
         ),
         provenance={"fixture": "koru-boundary-index-v3-two-capture"},
     )
