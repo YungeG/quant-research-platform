@@ -7,6 +7,48 @@ from .declarations import (
     TrialDeclaration,
     compile_trial_declarations,
 )
+from .integration import (
+    DataSlice,
+    FeatureBuildTask,
+    FeatureDatasetManifest,
+    FeatureRecipe,
+    ModelBuildEvidence,
+    ModelBuildPlan,
+    ModelTrainingTask,
+    TrainerRecipe,
+    validate_model_build,
+)
+from .integration import (
+    DataSlice as IntegratedDataSlice,
+)
+from .integration import (
+    ExperimentSpec as IntegratedExperimentSpec,
+)
+from .integration import (
+    HardFilter as IntegratedHardFilter,
+)
+from .integration import (
+    OrderingCriterion as IntegratedOrderingCriterion,
+)
+from .integration import (
+    ParameterCombination as IntegratedParameterCombination,
+)
+from .integration import (
+    SelectionPolicy as IntegratedSelectionPolicy,
+)
+from .integration import (
+    TrialDeclaration as IntegratedTrialDeclaration,
+)
+from .integration import (
+    build_trial_declarations as build_integrated_trial_declarations,
+)
+from .koru_boundary_indexes import (
+    BOUNDARY_INDEXES_LOG,
+    BoundaryIndexPublication,
+    BoundaryIndexPublicationFact,
+    open_published_koru_aggregate_trade_boundary_index_authority_v3,
+    publish_koru_aggregate_trade_boundary_index_authority_v3,
+)
 from .raw_blob_snapshots import (
     RAW_BLOB_SNAPSHOTS_LOG,
     RawBlobSnapshotFoundation,
@@ -14,25 +56,6 @@ from .raw_blob_snapshots import (
     RawBlobSnapshotPublicationFact,
     open_verified_raw_blob_snapshot,
     publish_raw_blob_snapshot,
-)
-from .integration import (
-    DataSlice,
-    DataSlice as IntegratedDataSlice,
-    ExperimentSpec as IntegratedExperimentSpec,
-    FeatureBuildTask,
-    FeatureDatasetManifest,
-    FeatureRecipe,
-    HardFilter as IntegratedHardFilter,
-    ModelBuildEvidence,
-    ModelBuildPlan,
-    ModelTrainingTask,
-    OrderingCriterion as IntegratedOrderingCriterion,
-    ParameterCombination as IntegratedParameterCombination,
-    SelectionPolicy as IntegratedSelectionPolicy,
-    TrainerRecipe,
-    TrialDeclaration as IntegratedTrialDeclaration,
-    build_trial_declarations as build_integrated_trial_declarations,
-    validate_model_build,
 )
 
 _RUNTIME_EXPORTS = frozenset(
@@ -56,11 +79,11 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "CampaignScope",
+    "BOUNDARY_INDEXES_LOG",
     "RAW_BLOB_SNAPSHOTS_LOG",
-    "RawBlobSnapshotFoundation",
-    "RawBlobSnapshotPublication",
-    "RawBlobSnapshotPublicationFact",
+    "BoundaryIndexPublication",
+    "BoundaryIndexPublicationFact",
+    "CampaignScope",
     "DataSlice",
     "DeferredTrialExecution",  # pyright: ignore[reportUnsupportedDunderAll]
     "FeatureBuildTask",
@@ -81,6 +104,9 @@ __all__ = [
     "ParameterCombination",
     "PublishedNoSelection",
     "PublishedStrategyCandidate",
+    "RawBlobSnapshotFoundation",
+    "RawBlobSnapshotPublication",
+    "RawBlobSnapshotPublicationFact",
     "SelectionPolicy",
     "TrainerRecipe",
     "TrialDeclaration",
@@ -89,7 +115,9 @@ __all__ = [
     "compile_trial_declarations",
     "execute_experiment",
     "execute_model_experiment",
+    "open_published_koru_aggregate_trade_boundary_index_authority_v3",
     "open_verified_raw_blob_snapshot",
+    "publish_koru_aggregate_trade_boundary_index_authority_v3",
     "publish_raw_blob_snapshot",
     "validate_model_build",
 ]

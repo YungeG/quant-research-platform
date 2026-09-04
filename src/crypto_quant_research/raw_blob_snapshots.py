@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from crypto_quant_bundle_builder import (
@@ -13,12 +14,13 @@ from crypto_quant_bundle_builder import (
 )
 from crypto_quant_domain import (
     ArtifactEnvelope,
+    ArtifactReadResult,
     ArtifactRef,
     RawBlobRef,
     canonical_bytes,
     canonical_sha256,
 )
-from crypto_quant_foundation import LogEntryRef
+from crypto_quant_foundation import AppendReceipt, LogEntry, LogEntryRef
 
 RAW_BLOB_SNAPSHOTS_LOG = "research.raw_snapshots.v1"
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -31,15 +33,17 @@ class RawBlobSnapshotFoundation(Protocol):
 
     def read_raw_blob(self, *, ref: RawBlobRef) -> bytes: ...
 
-    def raw_blob_path(self, *, ref: RawBlobRef): ...
+    def raw_blob_path(self, *, ref: RawBlobRef) -> Path: ...
 
     def put(self, *, envelope: ArtifactEnvelope) -> ArtifactRef: ...
 
-    def read(self, *, ref: ArtifactRef): ...
+    def read(self, *, ref: ArtifactRef) -> ArtifactReadResult: ...
 
-    def append(self, log_name: str, event_id: str, payload: bytes): ...
+    def append(self, log_name: str, event_id: str, payload: bytes) -> AppendReceipt: ...
 
-    def entries(self, log_name: str, through: LogEntryRef | None = None): ...
+    def entries(
+        self, log_name: str, through: LogEntryRef | None = None
+    ) -> tuple[LogEntry, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
