@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from crypto_quant_domain import (
     ArtifactEnvelope,
@@ -946,8 +946,8 @@ def _reserve_slice(
     data_slice: DataSlice,
     purpose: str,
     reservation_at: str,
-) -> None:
-    ledger.reserve(
+) -> LogEntryRef:
+    return ledger.reserve(
         SampleConsumptionRecord(
             data_slice.dataset_revision,
             data_slice.interval_start,
@@ -2322,6 +2322,97 @@ def _execute_model_build(
     return model_evidence
 
 
+@dataclass(frozen=True, slots=True)
+class PublishedTargetExperimentRegistration:
+    """Passive view of a new discovery reservation, not sample purity evidence."""
+
+    experiment_ref: ArtifactRef
+    target_recipe_ref: ArtifactRef
+    selection_declaration_ref: ArtifactRef
+    trial_declaration_refs: tuple[ArtifactRef, ...]
+    target_build_task_refs: tuple[ArtifactRef, ...]
+    discovery_reservation_refs: tuple[LogEntryRef, ...]
+
+    def __post_init__(self) -> None:
+        for value, name, version in (
+            (self.experiment_ref, "experiment_spec", 2),
+            (self.target_recipe_ref, "target_recipe", 1),
+            (self.selection_declaration_ref, "selection_declaration", 1),
+        ):
+            if type(value) is not ArtifactRef or (value.artifact_type, value.schema_version) != (name, version):
+                raise ValueError("registration requires exact published target-mode refs")
+        count = len(self.trial_declaration_refs)
+        for values, name in ((self.trial_declaration_refs, "trial_declaration"),
+                             (self.target_build_task_refs, "target_build_task")):
+            if (type(values) is not tuple or not count or len(values) != count
+                    or len(set(values)) != count
+                    or any(type(ref) is not ArtifactRef or (ref.artifact_type, ref.schema_version) != (name, 1)
+                           for ref in values)):
+                raise ValueError("registration must exactly cover unique discovery tasks")
+        if (type(self.discovery_reservation_refs) is not tuple
+                or len(self.discovery_reservation_refs) != count
+                or len(set(self.discovery_reservation_refs)) != count
+                or any(type(ref) is not LogEntryRef or ref.log_name != _SAMPLE_CONSUMPTION_LOG
+                       for ref in self.discovery_reservation_refs)):
+            raise ValueError("registration requires one real sample-log entry per Trial")
+
+    def to_canonical_dict(self) -> dict[str, object]:
+        return {
+            "type": "published_target_experiment_registration",
+            "experiment_ref": self.experiment_ref,
+            "target_recipe_ref": self.target_recipe_ref,
+            "selection_declaration_ref": self.selection_declaration_ref,
+            "trial_declaration_refs": self.trial_declaration_refs,
+            "target_build_task_refs": self.target_build_task_refs,
+            "discovery_reservation_refs": tuple({"log_name": ref.log_name,
+                "log_sequence": ref.log_sequence, "receipt_hash": ref.receipt_hash}
+                for ref in self.discovery_reservation_refs),
+            "operation_market_read_performed": False,
+            "operation_execution_performed": False,
+            "holdout_reserved": False,
+            "untouched_holdout_established": False,
+            "validation_report": None,
+            "deployment_authorized": False,
+        }
+
+
+def preregister_target_experiment(
+    frozen_inputs: FrozenTargetExperimentInputs,
+    foundation: LocalFoundation,
+) -> PublishedTargetExperimentRegistration:
+    """Publish and reserve discovery before any materializer/Backtest call.
+
+    Uses the same immutable declarations and reservation bytes as the existing
+    execute_target_experiment path. This is not an empty-ledger purity claim or
+    retrospective record of earlier reads. Retrying must reuse reservation_at.
+    A partial publication/append failure propagates; no passing view is emitted.
+    """
+    inputs = _normal_target_inputs(frozen_inputs)
+    if type(foundation) is not LocalFoundation:
+        raise TypeError("foundation must be a LocalFoundation")
+    if inputs.selection_policy.accepted_backtest_grades != ("development",):
+        raise ValueError("preregistration supports development discovery only")
+    base = _publish_target_base(inputs, foundation)
+    # Scope detection uses the verified owner prefix, not economic-evidence
+    # replay (which requires recovered target evidence and a Backtest port).
+    known_tasks = {_wire(_ref_payload(base.refs[cast(str, task.task_artifact_ref)]))
+                   for task in base.universe}
+    for _, _, payload in _published_entries(foundation, RESEARCH_EXECUTION_LOG):
+        if (_task_ref_wire(payload) in known_tasks
+                or payload.get("experiment_ref") == _ref_payload(base.experiment_ref)
+                or _foreign_task_for_experiment(foundation, payload, base.experiment_ref)):
+            raise ValueError("preregistration requires an experiment with no execution entries")
+    ledger = SampleConsumptionLedger(foundation)
+    reservations = tuple(_reserve_slice(ledger, base.refs[cast(str, trial.ref)], trial.data_slice,
+        "discovery", inputs.reservation_at) for trial in base.trials)
+    return PublishedTargetExperimentRegistration(
+        base.experiment_ref, base.refs[cast(str, inputs.target_recipe.ref)], base.selection_ref,
+        tuple(base.refs[cast(str, trial.ref)] for trial in base.trials),
+        tuple(base.refs[cast(str, task.task_artifact_ref)] for task in base.universe if task.kind == "TARGET_BUILD"),
+        reservations,
+    )
+
+
 def execute_target_experiment(
     frozen_inputs: FrozenTargetExperimentInputs,
     foundation: LocalFoundation,
@@ -2384,7 +2475,7 @@ def execute_model_experiment(
         model_evidence,
     )
     if model_evidence is not None:
-        executions = backtest.prepare_trials(base.trials, model_evidence)
+        executions = cast(Any, backtest).prepare_trials(base.trials, model_evidence)
         if type(executions) is not tuple or any(
             type(item) is not TrialExecution for item in executions
         ):
@@ -2435,9 +2526,11 @@ __all__ = [
     "FrozenModelExperimentInputs",
     "FrozenTargetExperimentInputs",
     "PublishedNoSelection",
+    "PublishedTargetExperimentRegistration",
     "PublishedStrategyCandidate",
     "TrialExecution",
     "execute_experiment",
     "execute_model_experiment",
     "execute_target_experiment",
+    "preregister_target_experiment",
 ]
