@@ -55,6 +55,7 @@ from .statistical_study import (
 )
 
 if TYPE_CHECKING:
+    from .provenance import verify_candidate_provenance
     from .runtime import (
         FrozenExperimentInputs,
         FrozenModelExperimentInputs,
@@ -90,6 +91,8 @@ _RUNTIME_EXPORTS = frozenset(
 
 
 def __getattr__(name: str):
+    if name == "verify_candidate_provenance":
+        return getattr(import_module(".provenance", __name__), name)
     if name in _RUNTIME_EXPORTS:
         return getattr(import_module(".runtime", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -143,4 +146,5 @@ __all__ = [
     "publish_statistical_read_task",
     "publish_statistical_study",
     "validate_model_build",
+    "verify_candidate_provenance",
 ]

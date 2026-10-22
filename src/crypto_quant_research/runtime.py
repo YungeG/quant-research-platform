@@ -11,7 +11,7 @@ from crypto_quant_domain import (
     canonical_bytes,
     canonical_sha256,
 )
-from crypto_quant_foundation import LocalFoundation, LogEntryRef
+from crypto_quant_foundation import FoundationFailure, LocalFoundation, LogEntryRef
 from crypto_quant_validation import SampleConsumptionLedger, SampleConsumptionRecord
 
 from .integration import (
@@ -449,6 +449,22 @@ class _PublishedBase:
     @property
     def experiment_ref(self) -> ArtifactRef:
         return self.refs[self.inputs.experiment_spec.ref]
+
+
+@dataclass
+class _ExecutionReplayContext:
+    experiment_spec: ExperimentSpec
+    universe: tuple[TaskRef, ...]
+    refs: dict[str, ArtifactRef]
+    selection: SelectionDeclaration
+
+    @property
+    def experiment_ref(self) -> ArtifactRef:
+        return self.refs[self.experiment_spec.ref]
+
+    @classmethod
+    def from_base(cls, base: _PublishedBase) -> _ExecutionReplayContext:
+        return cls(base.inputs.experiment_spec, base.universe, base.refs, base.selection)
 
 
 @dataclass
@@ -1295,6 +1311,8 @@ def _foreign_task_for_experiment(
         if candidate["type"] != "artifact_ref" or ref.artifact_type not in {
             "trial_declaration",
             "analysis_task",
+            "feature_build_task",
+            "model_training_task",
             "target_build_task",
         }:
             return False
@@ -1313,6 +1331,8 @@ def _foreign_task_for_experiment(
             or type(artifact) is not dict
         ):
             raise ValueError("invalid task artifact")
+    except FoundationFailure:
+        raise
     except (KeyError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
         raise ResearchCoreError("TASK_REF_FOREIGN") from error
     return artifact.get("experiment_ref") == _ref_payload(experiment_ref)
@@ -1353,7 +1373,7 @@ def _core_execution_value(artifact_type: str, payload: dict[str, object]) -> obj
 
 
 def _replay_execution_entries(
-    base: _PublishedBase,
+    base: _ExecutionReplayContext,
     foundation: LocalFoundation,
     through_log_sequence: int | None = None,
 ) -> tuple[list[ExecutionEntry], int | None]:
@@ -1428,7 +1448,7 @@ def _replay_existing(
         raise ResearchCoreError("EXPERIMENT_REOPENED_AFTER_CLOSE")
     manifest_entry, manifest_ref, manifest_payload = matching_manifests[0]
     core_entries, first_target_ledger_sequence = _replay_execution_entries(
-        base, foundation, manifest_entry.log_sequence
+        _ExecutionReplayContext.from_base(base), foundation, manifest_entry.log_sequence
     )
     manifests = [
         entry.payload
@@ -1467,7 +1487,7 @@ def _replay_existing(
 def _recover_execution(
     base: _PublishedBase, foundation: LocalFoundation
 ) -> _RecoveredExecution:
-    entries, _ = _replay_execution_entries(base, foundation)
+    entries, _ = _replay_execution_entries(_ExecutionReplayContext.from_base(base), foundation)
     outcomes: dict[TaskRef, TaskOutcome] = {}
     starts: dict[str, TaskAttemptStarted] = {}
     open_attempts: dict[TaskRef, TaskAttemptStarted] = {}
