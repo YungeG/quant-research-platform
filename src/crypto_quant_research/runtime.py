@@ -2427,6 +2427,7 @@ def execute_target_experiment(
         raise TypeError("foundation must be a LocalFoundation")
     if type(sample_ledger) is not SampleConsumptionLedger:
         raise TypeError("sample_ledger must be a SampleConsumptionLedger")
+    sample_ledger.require_foundation(foundation)
     _require_target_materializer(materializer, inputs.target_recipe)
     _require_target_backtest(backtest)
     base = _publish_target_base(inputs, foundation)
@@ -2460,6 +2461,7 @@ def execute_model_experiment(
         raise TypeError("foundation must be a LocalFoundation")
     if type(sample_ledger) is not SampleConsumptionLedger:
         raise TypeError("sample_ledger must be a SampleConsumptionLedger")
+    sample_ledger.require_foundation(foundation)
     _require_model_builder(builder)
     _require_model_backtest(backtest)
     base, feature_manifest, model_evidence = _publish_model_base(inputs, foundation)
@@ -2513,6 +2515,7 @@ def execute_experiment(
         raise TypeError("foundation must be a LocalFoundation")
     if type(sample_ledger) is not SampleConsumptionLedger:
         raise TypeError("sample_ledger must be a SampleConsumptionLedger")
+    sample_ledger.require_foundation(foundation)
     _require_backtest(backtest)
     base = _publish_base(inputs, foundation)
     existing = _replay_existing(base, foundation, sample_ledger, backtest)
