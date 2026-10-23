@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from crypto_quant_domain import canonical_bytes
+from crypto_quant_domain import ArtifactRef, canonical_bytes
 from crypto_quant_research import execute_experiment
 from crypto_quant_validation import VerifiedCandidateProvenance
 
@@ -215,6 +215,76 @@ def test_malformed_experiment_is_not_provenance(tmp_path):
     ref, _ = _publish(foundation, shell.ARTIFACT_LOG, "strategy_candidate", candidate)
     with pytest.raises(ValueError, match="CANDIDATE_PROVENANCE_INVALID"):
         verify_candidate_provenance(ref, foundation, port)
+
+
+@pytest.mark.parametrize("item", [0, "scalar", [], None], ids=["integer", "string", "list", "null"])
+def test_malformed_parameter_axis_item_is_rejected_read_only(item, tmp_path, monkeypatch):
+    from crypto_quant_research import verify_candidate_provenance
+    from crypto_quant_research.runtime import _publish
+
+    foundation, ledger, port = shell._runtime(tmp_path)
+    result = execute_experiment(shell._inputs(), foundation, ledger, port)
+    payload = shell._payload(foundation, result.execution_manifest_ref)
+    experiment_ref = payload["experiment_ref"]
+    experiment = shell._payload(foundation, ArtifactRef(
+        experiment_ref["artifact_type"], experiment_ref["schema_version"],
+        experiment_ref["content_hash"],
+    ))
+    experiment["parameter_combinations"] = [item]
+    experiment_ref, _ = _publish(foundation, shell.ARTIFACT_LOG, "experiment_spec", experiment)
+    family_ref, _ = _publish(foundation, shell.ARTIFACT_LOG, "candidate_family", {
+        "experiment_ref": experiment_ref.to_canonical_dict(),
+        "execution_manifest_ref": result.execution_manifest_ref.to_canonical_dict(),
+    })
+    candidate = shell._payload(foundation, result.strategy_candidate_ref)
+    candidate["candidate_family_ref"] = family_ref.to_canonical_dict()
+    candidate_ref, _ = _publish(foundation, shell.ARTIFACT_LOG, "strategy_candidate", candidate)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid provenance verification must be read-only")
+
+    for name in ("put", "append", "checkpoint", "_clock"):
+        monkeypatch.setattr(foundation, name, forbidden)
+    for name in ("run", "derive"):
+        monkeypatch.setattr(port, name, forbidden)
+    with pytest.raises(ValueError, match="^CANDIDATE_PROVENANCE_INVALID$"):
+        verify_candidate_provenance(candidate_ref, foundation, port)
+
+
+@pytest.mark.parametrize("kind", [
+    "backtest_trial_spec", "feature_dataset_manifest", "model_build_evidence",
+    "target_materialization_evidence",
+])
+def test_reversed_evidence_must_remain_an_object(kind, tmp_path, monkeypatch):
+    from crypto_quant_research import (
+        execute_model_experiment, execute_target_experiment, verify_candidate_provenance,
+    )
+    from crypto_quant_research.runtime import _publish
+
+    if kind in {"feature_dataset_manifest", "model_build_evidence"}:
+        module = _module("test_integrated_research")
+        foundation, ledger, builder, port, inputs, _ = module._model_runtime(tmp_path)
+        result = execute_model_experiment(inputs, foundation, ledger, builder, port)
+    elif kind == "target_materialization_evidence":
+        module = _module("test_target_stream_research")
+        foundation, ledger, materializer, port = module._runtime(tmp_path)
+        result = execute_target_experiment(module._inputs(), foundation, ledger, materializer, port)
+    else:
+        foundation, ledger, port = shell._runtime(tmp_path)
+        result = execute_experiment(shell._inputs(), foundation, ledger, port)
+    manifest = shell._payload(foundation, result.execution_manifest_ref)
+    # An object-shaped publication can reverse to a local-ref scalar, not a dict.
+    _publish(foundation, shell.ARTIFACT_LOG, kind, manifest["experiment_ref"])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid provenance verification must be read-only")
+
+    for name in ("put", "append", "checkpoint", "_clock"):
+        monkeypatch.setattr(foundation, name, forbidden)
+    for name in ("run", "derive"):
+        monkeypatch.setattr(port, name, forbidden)
+    with pytest.raises(ValueError, match="^CANDIDATE_PROVENANCE_INVALID$"):
+        verify_candidate_provenance(result.strategy_candidate_ref, foundation, port)
 
 
 def test_public_root_keeps_runtime_lazy():

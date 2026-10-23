@@ -114,10 +114,13 @@ def _load_provenance_context(
         recipe = TargetRecipe(**{**recipe, "input_names": tuple(recipe["input_names"])})
         bind(recipe, "target_recipe")
         target_ref = recipe.ref
+    parameter_axis = experiment["parameter_combinations"]
+    if type(parameter_axis) is not list or any(type(item) is not dict for item in parameter_axis):
+        raise ValueError("parameter_combinations must be an array of objects")
     spec_args = dict(experiment)
     spec_args.update(
         data_slices=tuple(DataSlice(**item) for item in experiment["data_slices"]),
-        parameter_combinations=tuple(ParameterCombination(tuple(sorted(item.items()))) for item in experiment["parameter_combinations"]),
+        parameter_combinations=tuple(ParameterCombination(tuple(sorted(item.items()))) for item in parameter_axis),
         seeds=tuple(experiment["seeds"]), scenario_refs=tuple(experiment["scenario_refs"]),
         metric_profile_refs=tuple(experiment["metric_profile_refs"]), model_build_plan=plan,
     )
@@ -159,6 +162,8 @@ def _load_provenance_context(
         reverse = {_wire(_ref_payload(actual)): local for local, actual in refs.items()}
         converted = _reverse(payload, reverse)
         if ref.artifact_type == "backtest_trial_spec":
+            if type(converted) is not dict:
+                raise ValueError("trial spec must reconstruct to an object")
             trial = converted.get("trial_declaration_ref")
             if type(trial) is str and trial in trial_refs:
                 read(ref, "backtest_trial_spec")
@@ -168,6 +173,8 @@ def _load_provenance_context(
                     raise ValueError("ambiguous trial spec")
                 trial_specs[trial] = ref
         elif ref.artifact_type in {"feature_dataset_manifest", "model_build_evidence"} and plan is not None:
+            if type(converted) is not dict:
+                raise ValueError("model evidence must reconstruct to an object")
             if converted.get("model_build_plan_ref") != plan.ref:
                 continue
             cls = FeatureDatasetManifest if ref.artifact_type == "feature_dataset_manifest" else ModelBuildEvidence
@@ -186,6 +193,8 @@ def _load_provenance_context(
                     raise ValueError("ambiguous feature manifest")
                 feature_manifest = value
         elif ref.artifact_type == "target_materialization_evidence" and target_ref is not None:
+            if type(converted) is not dict:
+                raise ValueError("target evidence must reconstruct to an object")
             if type(converted.get("trial_declaration_ref")) is not str or converted["trial_declaration_ref"] not in trial_refs:
                 continue
             value = TargetMaterializationEvidence(**converted)
