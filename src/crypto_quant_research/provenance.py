@@ -25,6 +25,25 @@ from .runtime import (
 )
 
 
+_EXPERIMENT_BASE_FIELDS = {
+    "hypothesis_ref",
+    "strategy_definition_ref",
+    "data_slices",
+    "parameter_combinations",
+    "seeds",
+    "scenario_refs",
+    "backtest_template_ref",
+    "model_build_plan",
+    "metric_profile_refs",
+    "budget",
+}
+_EXPERIMENT_FIELDS_BY_VERSION = {
+    1: _EXPERIMENT_BASE_FIELDS,
+    2: _EXPERIMENT_BASE_FIELDS | {"target_recipe_ref"},
+    3: _EXPERIMENT_BASE_FIELDS | {"evaluation_slices"},
+}
+
+
 def _artifact_ref(value: object) -> ArtifactRef:
     if type(value) is not dict or set(value) != {
         "type", "artifact_type", "schema_version", "content_hash"
@@ -88,7 +107,31 @@ def _load_provenance_context(
 
     _, candidate_ref, candidate = read(candidate_ref, "strategy_candidate", (1, 2, 3))
     _, family_ref, family = read(candidate["candidate_family_ref"], "candidate_family")
-    _, experiment_ref, experiment = read(family["experiment_ref"], "experiment_spec", (1, 2))
+    _, experiment_ref, experiment = read(family["experiment_ref"], "experiment_spec", (1, 2, 3))
+    if (
+        type(experiment) is not dict
+        or set(experiment) != _EXPERIMENT_FIELDS_BY_VERSION[experiment_ref.schema_version]
+    ):
+        raise ValueError("invalid Experiment fields")
+    for axis in (
+        "data_slices", "parameter_combinations", "seeds", "scenario_refs", "metric_profile_refs"
+    ):
+        if type(experiment[axis]) is not list:
+            raise ValueError("Experiment axes must be arrays")
+    slice_axes = (
+        ("data_slices", "evaluation_slices")
+        if experiment_ref.schema_version == 3 else ("data_slices",)
+    )
+    for axis in slice_axes:
+        values = experiment[axis]
+        if type(values) is not list or not values or any(
+            type(item) is not dict
+            or set(item) != {
+                "market_bundle_ref", "dataset_revision", "interval_start", "interval_end"
+            }
+            for item in values
+        ):
+            raise ValueError("slice axes must be nonempty arrays of DataSlice objects")
     manifest_entry, manifest_ref, manifest = read(
         family["execution_manifest_ref"], "experiment_execution_manifest", log=RESEARCH_EXECUTION_LOG
     )
@@ -126,7 +169,13 @@ def _load_provenance_context(
     )
     if target_ref is not None:
         spec_args["target_recipe_ref"] = target_ref
+    if experiment_ref.schema_version == 3:
+        spec_args["evaluation_slices"] = tuple(
+            DataSlice(**item) for item in experiment["evaluation_slices"]
+        )
     spec = ExperimentSpec(**spec_args)
+    if spec.schema_version != experiment_ref.schema_version:
+        raise ValueError("Experiment schema mismatch")
     if bind(spec, "experiment_spec", spec.schema_version)[1] != experiment_ref:
         raise ValueError("Experiment reconstruction mismatch")
     trials = build_trial_declarations(spec)

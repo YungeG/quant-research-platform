@@ -119,7 +119,7 @@ def _reverse(value: object, refs: Mapping[str, str]) -> object:
 
 def _artifact_schema_versions(artifact_type: str) -> set[int]:
     if artifact_type == "experiment_spec":
-        return {1, 2}
+        return {1, 2, 3}
     if artifact_type == "strategy_candidate":
         return {1, 2, 3}
     return {1}
@@ -272,7 +272,12 @@ class FrozenExperimentInputs:
             raise TypeError("trial_executions must be a tuple of TrialExecution")
         if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
-        if self.experiment_spec.schema_version != 1:
+        if self.experiment_spec.schema_version != 1 and not (
+            self.experiment_spec.schema_version == 3
+            and self.experiment_spec.model_build_plan is not None
+            and self.experiment_spec.evaluation_slices is not None
+            and self.experiment_spec.target_recipe_ref is None
+        ):
             raise ResearchCoreError("EXPERIMENT_SPEC_INVALID")
         object.__setattr__(self, "selection_declared_by_ref", _plain(self.selection_declared_by_ref))
 
@@ -333,7 +338,7 @@ class FrozenModelExperimentInputs:
                 raise TypeError(f"{name} must be exact {expected_type.__name__}")
         if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
-        if self.experiment_spec.schema_version != 1:
+        if self.experiment_spec.schema_version not in (1, 3):
             raise ResearchCoreError("MODEL_BUILD_PLAN_INVALID")
         if (
             self.experiment_spec.model_build_plan != self.model_build_plan.ref
@@ -2497,6 +2502,12 @@ def execute_model_experiment(
         model_evidence,
     )
     if model_evidence is not None:
+        # Preparation materializes requests from market input, so reserve first.
+        for trial in base.trials:
+            _reserve(
+                sample_ledger, base.refs[cast(str, trial.ref)], trial,
+                "discovery", inputs.reservation_at,
+            )
         executions = cast(Any, backtest).prepare_trials(base.trials, model_evidence)
         if type(executions) is not tuple or any(
             type(item) is not TrialExecution for item in executions

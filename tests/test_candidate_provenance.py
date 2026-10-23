@@ -70,6 +70,9 @@ def test_schema_smoke(mode, tmp_path, monkeypatch):
         monkeypatch.setattr(port, name, forbidden)
     verified = verify_candidate_provenance(result.strategy_candidate_ref, foundation, port)
     assert canonical_bytes(verified.candidate_ref) == canonical_bytes(result.strategy_candidate_ref)
+    if mode == "model":
+        assert verified.experiment_ref["schema_version"] == 3
+        assert verified.candidate_ref["schema_version"] == 2
 
 
 def test_selection_loads_nonselected_completed_witnesses(tmp_path, monkeypatch):
@@ -325,3 +328,59 @@ def test_known_build_task_reopening_rejected(mode, kind, tmp_path):
     })
     with pytest.raises(ValueError, match="CANDIDATE_PROVENANCE_INVALID"):
         verify_candidate_provenance(result.strategy_candidate_ref, foundation, port)
+
+
+def test_experiment_decoder_rejects_version_field_and_scalar_shapes_read_only(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from crypto_quant_research import execute_model_experiment, verify_candidate_provenance
+    from crypto_quant_research import provenance
+    module = _module('test_integrated_research')
+    foundation, ledger, builder, port, inputs, _ = module._model_runtime(tmp_path)
+    result = execute_model_experiment(inputs, foundation, ledger, builder, port)
+    original = provenance._read_published_node
+    state = {}
+    def read(foundation, ref, log, versions):
+        node = original(foundation, ref, log, versions)
+        if ref.artifact_type != 'experiment_spec':
+            return node
+        payload = deepcopy(node[2])
+        mode = state['mode']
+        version = 3
+        if mode in ('legacy1', 'legacy2'):
+            version = 1 if mode == 'legacy1' else 2
+        elif mode == 'missing':
+            del payload['evaluation_slices']
+        elif mode == 'extra':
+            payload['extra'] = 1
+        elif mode == 'target':
+            payload['target_recipe_ref'] = None
+        elif mode == 'parameter_item':
+            payload['parameter_combinations'] = [7]
+        elif mode == 'canonical':
+            payload['budget'] = {'max_trials': 100}
+        elif mode == 'eval_null':
+            payload['evaluation_slices'] = None
+        elif mode == 'eval_empty':
+            payload['evaluation_slices'] = []
+        elif mode == 'eval_item':
+            payload['evaluation_slices'] = [7]
+        elif mode == 'eval_fields':
+            payload['evaluation_slices'][0]['extra'] = 7
+        elif mode == 'eval_object':
+            payload['evaluation_slices'] = {}
+        elif mode == 'legacy_inference':
+            del payload['evaluation_slices']
+        else:
+            payload[mode] = 7
+        return node[0], ArtifactRef('experiment_spec', version, ref.content_hash), payload
+    def forbidden(*args, **kwargs):
+        pytest.fail('decoder must not write or execute')
+    monkeypatch.setattr(provenance, '_read_published_node', read)
+    for name in ('put', 'append', 'checkpoint', '_clock'):
+        monkeypatch.setattr(foundation, name, forbidden)
+    for mode in ('legacy1', 'legacy2', 'missing', 'extra', 'target', 'parameter_item', 'canonical',
+                 'eval_null', 'eval_empty', 'eval_item', 'eval_fields', 'eval_object', 'legacy_inference', 'data_slices', 'evaluation_slices', 'parameter_combinations',
+                 'seeds', 'scenario_refs', 'metric_profile_refs'):
+        state['mode'] = mode
+        with pytest.raises(ValueError, match='^CANDIDATE_PROVENANCE_INVALID$'):
+            verify_candidate_provenance(result.strategy_candidate_ref, foundation, port)

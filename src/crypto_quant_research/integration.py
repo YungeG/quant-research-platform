@@ -56,7 +56,7 @@ _LOCAL_REF_TYPES = {
     "target_materialization_evidence",
 }
 _LOCAL_REF = re.compile(
-    r"rp-core:(?P<artifact_type>[a-z][a-z0-9_]*)@(?P<schema_version>[12]):sha256:[0-9a-f]{64}"
+    r"rp-core:(?P<artifact_type>[a-z][a-z0-9_]*)@(?P<schema_version>[123]):sha256:[0-9a-f]{64}"
 )
 _TASK_KINDS = {
     "FEATURE_BUILD",
@@ -151,7 +151,14 @@ def _canonical_ref(
         if type(value) is not str:
             raise ValueError(f"{name} must use the RP-CORE local reference wire")
         match = _LOCAL_REF.fullmatch(value)
-        if match is None or match["artifact_type"] != expected_artifact_type:
+        if (
+            match is None
+            or match["artifact_type"] != expected_artifact_type
+            or (
+                match["schema_version"] == "3"
+                and match["artifact_type"] != "experiment_spec"
+            )
+        ):
             raise ValueError(f"{name} must address {expected_artifact_type}")
         return value
     if expected_type is None and expected_artifact_type == "backtest_metric_profile":
@@ -907,6 +914,7 @@ class ExperimentSpec:
     metric_profile_refs: tuple[object, ...]
     budget: object
     target_recipe_ref: object | None = None
+    evaluation_slices: tuple[DataSlice, ...] | None = None
 
     def __post_init__(self) -> None:
         plan = self.model_build_plan
@@ -918,6 +926,8 @@ class ExperimentSpec:
                 "EXPERIMENT_SPEC_INVALID",
                 "target mode excludes model_build_plan",
             )
+        if self.evaluation_slices is not None and plan is None:
+            _fail("MODEL_BUILD_PLAN_INVALID", "evaluations require a ModelBuildPlan")
         try:
             object.__setattr__(
                 self,
@@ -967,6 +977,22 @@ class ExperimentSpec:
                     "MODEL_BUILD_PLAN_INVALID",
                     "training_slice must be one of the Experiment data_slices",
                 )
+            if self.evaluation_slices is not None:
+                self._validate_object_axis(
+                    "evaluation_slices",
+                    self.evaluation_slices,
+                    DataSlice,
+                    lambda item: item.canonical_wire,
+                )
+                declared = {item.canonical_wire for item in self.data_slices}
+                expected = {plan.training_slice.canonical_wire} | {
+                    item.canonical_wire for item in self.evaluation_slices
+                }
+                if declared != expected or any(
+                    item.interval_start < plan.training_slice.interval_end
+                    for item in self.evaluation_slices
+                ):
+                    _fail("EXPERIMENT_SPEC_INVALID", "invalid evaluation union or chronology")
             object.__setattr__(self, "model_build_plan", plan.ref)
 
         if type(self.seeds) is not tuple or not self.seeds:
@@ -1039,13 +1065,23 @@ class ExperimentSpec:
             "metric_profile_refs": self.metric_profile_refs,
             "budget": self.budget,
         }
+        if self.evaluation_slices is not None:
+            payload["evaluation_slices"] = tuple(
+                item.payload for item in self.evaluation_slices
+            )
         if self.target_recipe_ref is not None:
             payload["target_recipe_ref"] = self.target_recipe_ref
         return MappingProxyType(payload)
 
     @property
     def schema_version(self) -> int:
+        if self.evaluation_slices is not None:
+            return 3
         return 2 if self.target_recipe_ref is not None else 1
+
+    @property
+    def trial_data_slices(self) -> tuple[DataSlice, ...]:
+        return self.data_slices if self.evaluation_slices is None else self.evaluation_slices
 
     @property
     def ref(self) -> object:
@@ -1554,7 +1590,7 @@ def build_trial_declarations(
             ),
         )
         for parameters in experiment_spec.parameter_combinations
-        for data_slice in experiment_spec.data_slices
+        for data_slice in experiment_spec.trial_data_slices
         for scenario_ref in experiment_spec.scenario_refs
         for seed in experiment_spec.seeds
     )

@@ -442,3 +442,99 @@ def test_public_surface_adds_values_without_model_runtime_abi() -> None:
         "sklearn",
     ):
         assert forbidden not in runtime_source
+
+
+def _evaluation_spec(**overrides):
+    feature, trainer, plan = _recipes()
+    evaluation = DataSlice(plan.training_slice.market_bundle_ref, 'evaluation',
+                           '2026-02-01T00:00:00.000000Z',
+                           '2026-03-01T00:00:00.000000Z')
+    legacy = _spec(plan)
+    values = {field.name: getattr(legacy, field.name) for field in fields(legacy)}
+    values.update(model_build_plan=plan,
+                  data_slices=tuple(sorted((plan.training_slice, evaluation), key=lambda x: x.canonical_wire)),
+                  evaluation_slices=(evaluation,))
+    values.update(overrides)
+    return ExperimentSpec(**values)
+
+
+def test_model_evaluation_axis_is_exact_union_and_ten_tasks():
+    spec = _evaluation_spec()
+    assert spec.schema_version == 3
+    assert len(spec.data_slices) == 2
+    assert spec.trial_data_slices == spec.evaluation_slices
+    tasks = build_task_universe(spec)
+    assert len(tasks) == 10
+    assert all(t.artifact.data_slice == spec.evaluation_slices[0] for t in tasks if t.kind == 'TRIAL')
+
+
+@pytest.mark.parametrize('axis,code', [((), 'EXPERIMENT_SPEC_INVALID'), ([], 'EXPERIMENT_SPEC_INVALID'),
+    (42, 'EXPERIMENT_SPEC_INVALID'), (('wrong',), 'EXPERIMENT_SPEC_INVALID')])
+def test_evaluation_axis_rejects_malformed_values(axis, code):
+    _assert_code(code, lambda: _evaluation_spec(evaluation_slices=axis))
+
+
+def test_evaluation_none_preserves_legacy_model_and_target_wires():
+    for plan in (None, _recipes()[2]):
+        legacy = _spec(plan)
+        values = {field.name: getattr(legacy, field.name) for field in fields(legacy)}
+        values.update(model_build_plan=plan, evaluation_slices=None)
+        assert ExperimentSpec(**values).ref == legacy.ref
+        assert ExperimentSpec(**values).payload == legacy.payload
+    assert _spec().ref.endswith('77d5e939e805e2cea4bb4687e28f91273f108eb3f788dc2104a36bb19ace8bc3')
+
+
+def test_schema3_local_ref_is_experiment_only():
+    from crypto_quant_research.integration import _canonical_ref
+    assert _canonical_ref(_evaluation_spec().ref, 'experiment', expected_artifact_type='experiment_spec')
+    with pytest.raises(ValueError):
+        _canonical_ref('rp-core:model_build_plan@3:' + _hash('a'), 'plan', expected_artifact_type='model_build_plan')
+
+
+def test_schema3_publish_gate_is_experiment_only():
+    from crypto_quant_research.runtime import _artifact_schema_versions
+    assert _artifact_schema_versions('experiment_spec') == {1, 2, 3}
+    for kind in ('model_build_plan', 'model_build_evidence', 'trial_declaration'):
+        assert _artifact_schema_versions(kind) == {1}
+
+
+def test_evaluation_union_chronology_and_plan_failures():
+    spec = _evaluation_spec()
+    evaluation = spec.evaluation_slices[0]
+    training = _recipes()[2].training_slice
+    _assert_code('MODEL_BUILD_PLAN_INVALID', lambda: _evaluation_spec(model_build_plan=None))
+    _assert_code('MODEL_BUILD_PLAN_INVALID', lambda: _evaluation_spec(model_build_plan=_recipes()[2].ref))
+    _assert_code('MODEL_BUILD_PLAN_INVALID', lambda: _evaluation_spec(data_slices=(evaluation,)))
+    _assert_code('EXPERIMENT_SPEC_INVALID', lambda: _evaluation_spec(evaluation_slices=(training,)))
+    _assert_code('TASK_AXIS_DUPLICATE', lambda: _evaluation_spec(evaluation_slices=(evaluation, evaluation)))
+    extra = DataSlice(evaluation.market_bundle_ref, 'extra', evaluation.interval_start, evaluation.interval_end)
+    _assert_code('EXPERIMENT_SPEC_INVALID', lambda: _evaluation_spec(data_slices=tuple(sorted((*spec.data_slices, extra), key=lambda x: x.canonical_wire))))
+    _assert_code('EXPERIMENT_SPEC_INVALID', lambda: _evaluation_spec(evaluation_slices=(extra,)))
+
+
+def test_both_frozen_inputs_accept_schema3_not_target():
+    from crypto_quant_research import FrozenExperimentInputs, FrozenModelExperimentInputs, TrialExecution
+    from crypto_quant_research.integration import build_trial_declarations
+    from . import test_research_shell as shell
+    from . import test_target_stream_research as target
+    feature, trainer, plan = _recipes()
+    spec = _evaluation_spec()
+    policy = shell._policy(spec)
+    FrozenModelExperimentInputs(spec, feature, trainer, plan, policy, 'research', shell.RESERVED_AT)
+    executions = tuple(TrialExecution(t.ref, {}, {'request': index}) for index, t in enumerate(build_trial_declarations(spec)))
+    FrozenExperimentInputs(spec, policy, 'research', executions, shell.RESERVED_AT)
+    _assert_code('TASK_REF_FOREIGN', lambda: FrozenExperimentInputs(spec, policy, 'research', (), shell.RESERVED_AT))
+    target_spec = target._spec()
+    _assert_code('EXPERIMENT_SPEC_INVALID', lambda: FrozenExperimentInputs(target_spec, target._policy(target_spec), 'research', (), shell.RESERVED_AT))
+    _assert_code('MODEL_BUILD_PLAN_INVALID', lambda: FrozenModelExperimentInputs(target_spec, feature, trainer, plan, target._policy(target_spec), 'research', shell.RESERVED_AT))
+    assert _spec(plan).ref.endswith('41d35ed1c671b2b8b3db7e749703279622e402004acaae7ded955fed089e2bf1')
+    assert target_spec.ref.endswith('e22066cea993e4acbf6b20c7959a4d49a779a6ae3374fb66b0999065aaadce0f')
+
+
+def test_evaluation_order_and_target_exclusion():
+    evaluation = _evaluation_spec().evaluation_slices[0]
+    later = DataSlice(evaluation.market_bundle_ref, 'later',
+                      '2026-03-01T00:00:00.000000Z', '2026-04-01T00:00:00.000000Z')
+    sorted_axis = tuple(sorted((evaluation, later), key=lambda item: item.canonical_wire))
+    _assert_code('EXPERIMENT_SPEC_INVALID', lambda: _evaluation_spec(evaluation_slices=sorted_axis[::-1]))
+    _assert_code('EXPERIMENT_SPEC_INVALID', lambda: _evaluation_spec(target_recipe_ref='target'))
