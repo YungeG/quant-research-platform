@@ -1,3 +1,12 @@
+from .input_qualification import (
+    InputQualificationDeclarationV1,
+    InputQualificationReadTaskV1,
+    InputQualificationCaptureBindingV1,
+    PublishedInputQualificationArtifactV1,
+    publish_input_qualification_declaration,
+    publish_input_qualification_read_task,
+    publish_input_qualification_capture_binding,
+)
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -55,7 +64,7 @@ from .statistical_study import (
 )
 
 if TYPE_CHECKING:
-    from .provenance import verify_candidate_provenance
+    from .provenance import read_experiment_outcome_view, verify_candidate_provenance
     from .runtime import (
         FrozenExperimentInputs,
         FrozenModelExperimentInputs,
@@ -67,6 +76,8 @@ if TYPE_CHECKING:
         execute_experiment,
         execute_model_experiment,
         execute_target_experiment,
+        preregister_input_capture_target_experiment,
+        execute_input_capture_target_experiment,
         preregister_target_experiment,
     )
 
@@ -85,13 +96,15 @@ _RUNTIME_EXPORTS = frozenset(
         "execute_experiment",
         "execute_model_experiment",
         "execute_target_experiment",
+        "preregister_input_capture_target_experiment",
+        "execute_input_capture_target_experiment",
         "preregister_target_experiment",
     }
 )
 
 
 def __getattr__(name: str):
-    if name == "verify_candidate_provenance":
+    if name in {"read_experiment_outcome_view", "verify_candidate_provenance"}:
         return getattr(import_module(".provenance", __name__), name)
     if name in _RUNTIME_EXPORTS:
         return getattr(import_module(".runtime", __name__), name)
@@ -99,6 +112,14 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "InputQualificationDeclarationV1",
+    "InputQualificationReadTaskV1",
+    "InputQualificationCaptureBindingV1",
+    "PublishedInputQualificationArtifactV1",
+    "publish_input_qualification_declaration",
+    "publish_input_qualification_read_task",
+    "publish_input_qualification_capture_binding",
+
     "CampaignScope",
     "DataSlice",
     "ExperimentParameterCombination",
@@ -139,6 +160,8 @@ __all__ = [
     "execute_experiment",
     "execute_model_experiment",
     "execute_target_experiment",
+    "execute_input_capture_target_experiment",
+    "preregister_input_capture_target_experiment",
     "preregister_target_experiment",
     "publish_retrospective_protocol",
     "publish_retrospective_read_task",
@@ -147,4 +170,5 @@ __all__ = [
     "publish_statistical_study",
     "validate_model_build",
     "verify_candidate_provenance",
+    "read_experiment_outcome_view",
 ]

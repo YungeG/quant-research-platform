@@ -12,7 +12,12 @@ from crypto_quant_domain import (
     canonical_sha256,
 )
 from crypto_quant_foundation import FoundationFailure, LocalFoundation, LogEntryRef
-from crypto_quant_validation import SampleConsumptionLedger, SampleConsumptionRecord
+from crypto_quant_validation import (
+    InputQualificationError, InputQualificationVerifierV1,
+    SampleConsumptionLedger, SampleConsumptionRecord, ValidationCoreFailure,
+)
+
+from .input_qualification import _event as _input_qualification_event, _require_verifier
 
 from .integration import (
     RESEARCH_EXECUTION_LOG,
@@ -165,7 +170,16 @@ def _published_entries(
             if canonical_bytes(envelope) != entry.payload:
                 raise ValueError("entry is not canonical")
             ref = ArtifactRef.from_envelope(envelope)
-            if entry.event_id != _artifact_event_id(log_name, ref):
+            if ref.artifact_type in {
+                "input_qualification_declaration", "input_qualification_read_task",
+                "input_qualification_capture_binding",
+            }:
+                if log_name != _RESEARCH_ARTIFACTS_LOG:
+                    raise ValueError("input qualification requires its Research owner log")
+                expected_event = _input_qualification_event(envelope)
+            else:
+                expected_event = _artifact_event_id(log_name, ref)
+            if entry.event_id != expected_event:
                 raise ValueError("entry has the wrong event id")
             payload = _plain(envelope.payload)
             if type(payload) is not dict:
@@ -1110,7 +1124,12 @@ def _verified_analysis(
 def _load_verified_analyses(
     manifest: ExperimentExecutionManifest, backtest: object
 ) -> tuple[VerifiedAnalysis, ...]:
-    outcomes = manifest.outcome_map
+    return _load_verified_outcome_analyses(manifest.outcome_map, backtest)
+
+
+def _load_verified_outcome_analyses(
+    outcomes: Mapping[TaskRef, TaskOutcome], backtest: object
+) -> tuple[VerifiedAnalysis, ...]:
     completed: dict[str, Mapping[str, object]] = {}
     trial_outcomes: dict[str, TaskOutcome] = {}
     for task, outcome in outcomes.items():
@@ -1493,11 +1512,17 @@ def _recover_execution(
     base: _PublishedBase, foundation: LocalFoundation
 ) -> _RecoveredExecution:
     entries, _ = _replay_execution_entries(_ExecutionReplayContext.from_base(base), foundation)
+    return _recover_execution_prefix(_ExecutionReplayContext.from_base(base), entries)
+
+
+def _recover_execution_prefix(
+    context: _ExecutionReplayContext, entries: list[ExecutionEntry]
+) -> _RecoveredExecution:
     outcomes: dict[TaskRef, TaskOutcome] = {}
     starts: dict[str, TaskAttemptStarted] = {}
     open_attempts: dict[TaskRef, TaskAttemptStarted] = {}
     last_closes: dict[TaskRef, TaskAttemptClosed] = {}
-    canonical_tasks = {task.canonical_wire: task for task in base.universe}
+    canonical_tasks = {task.canonical_wire: task for task in context.universe}
 
     for index, entry in enumerate(entries[1:], start=1):
         value = entry.payload
@@ -1665,14 +1690,20 @@ def _target_request(
     base: _PublishedBase,
     trial: TrialDeclaration,
 ) -> dict[str, object]:
-    target_recipe_ref = base.inputs.experiment_spec.target_recipe_ref
+    return _target_request_for_trial(_ExecutionReplayContext.from_base(base), trial)
+
+
+def _target_request_for_trial(
+    context: _ExecutionReplayContext, trial: TrialDeclaration
+) -> dict[str, object]:
+    target_recipe_ref = context.experiment_spec.target_recipe_ref
     if type(target_recipe_ref) is not str:
         raise ResearchCoreError("TARGET_RECIPE_INVALID")
     return {
         "type": "target_materialization_request",
         "schema_version": 1,
-        "consumer_ref": _ref_payload(base.refs[trial.ref]),
-        "target_recipe_ref": _ref_payload(base.refs[target_recipe_ref]),
+        "consumer_ref": _ref_payload(context.refs[trial.ref]),
+        "target_recipe_ref": _ref_payload(context.refs[target_recipe_ref]),
         "market_bundle_ref": _plain(trial.data_slice.market_bundle_ref),
         "dataset_revision": _plain(trial.data_slice.dataset_revision),
         "interval_start": _plain(trial.data_slice.interval_start),
@@ -2438,12 +2469,110 @@ def preregister_target_experiment(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _InputCaptureGate:
+    inputs: FrozenTargetExperimentInputs
+    binding_publication: tuple
+    verifier: InputQualificationVerifierV1
+    foundation: LocalFoundation
+
+    def require_base(self, base: _PublishedBase) -> None:
+        self.verifier.require_foundation(self.foundation)
+        expected_trials = build_trial_declarations(self.inputs.experiment_spec)
+        expected_experiment = ArtifactRef.from_envelope(ArtifactEnvelope.create(
+            "experiment_spec", 2, _translate(self.inputs.experiment_spec.payload, base.refs)))
+        if (base.inputs != self.inputs or base.trials != expected_trials
+                or base.experiment_ref != expected_experiment):
+            raise InputQualificationError("TRIAL_CAPTURE_MISMATCH")
+        expected_refs = tuple(ArtifactRef.from_envelope(ArtifactEnvelope.create(
+            "trial_declaration", 1, _translate(trial.payload, base.refs))) for trial in expected_trials)
+        actual_refs = tuple(base.refs.get(trial.ref) for trial in base.trials)
+        if (actual_refs != expected_refs or len(set(actual_refs)) != len(expected_trials)):
+            raise InputQualificationError("TRIAL_CAPTURE_MISMATCH")
+        for trial_ref in actual_refs:
+            self.verifier.require_trial_binding(self.binding_publication, trial_ref)
+
+
+def _input_capture_gate(frozen_inputs: FrozenTargetExperimentInputs, binding_publication: tuple,
+                        foundation: LocalFoundation, verifier: InputQualificationVerifierV1) -> _InputCaptureGate:
+    _require_verifier(foundation, verifier)
+    inputs = _normal_target_inputs(frozen_inputs)
+    view = verifier.verify_capture(binding_publication)
+    for data in inputs.experiment_spec.data_slices:
+        if (data.dataset_revision != view.capture_revision
+                or canonical_bytes(data.market_bundle_ref) != canonical_bytes(view.market_bundle_ref)
+                or not any(start <= data.interval_start < data.interval_end <= end
+                           for _, start, end in view.source_intervals)):
+            raise InputQualificationError("TRIAL_CAPTURE_MISMATCH")
+    return _InputCaptureGate(inputs, binding_publication, verifier, foundation)
+
+
+def preregister_input_capture_target_experiment(
+    frozen_inputs: FrozenTargetExperimentInputs,
+    binding_publication: tuple,
+    foundation: LocalFoundation,
+    verifier: InputQualificationVerifierV1,
+) -> PublishedTargetExperimentRegistration:
+    """Reserve genuine Trials bound to an owner-attested capture, not qualified data."""
+    gate = _input_capture_gate(frozen_inputs, binding_publication, foundation, verifier)
+    registration = preregister_target_experiment(gate.inputs, foundation)
+    expected = build_trial_declarations(gate.inputs.experiment_spec)
+    refs = {gate.inputs.experiment_spec.ref: registration.experiment_ref,
+            gate.inputs.target_recipe.ref: registration.target_recipe_ref}
+    expected_refs = tuple(ArtifactRef.from_envelope(ArtifactEnvelope.create(
+        "trial_declaration", 1, _translate(trial.payload, refs))) for trial in expected)
+    expected_experiment = ArtifactRef.from_envelope(ArtifactEnvelope.create(
+        "experiment_spec", 2, _translate(gate.inputs.experiment_spec.payload, refs)))
+    if (registration.trial_declaration_refs != expected_refs
+            or registration.experiment_ref != expected_experiment):
+        raise InputQualificationError("TRIAL_CAPTURE_MISMATCH")
+    for trial_ref in registration.trial_declaration_refs:
+        verifier.require_trial_binding(binding_publication, trial_ref)
+    return registration
+
+
+def execute_input_capture_target_experiment(
+    frozen_inputs: FrozenTargetExperimentInputs,
+    binding_publication: tuple,
+    foundation: LocalFoundation,
+    sample_ledger: SampleConsumptionLedger,
+    verifier: InputQualificationVerifierV1,
+    materializer: object,
+    backtest: object,
+) -> PublishedStrategyCandidate | PublishedNoSelection:
+    _require_verifier(foundation, verifier)
+    if type(sample_ledger) is not SampleConsumptionLedger:
+        raise InputQualificationError("FOUNDATION_MISMATCH")
+    try:
+        sample_ledger.require_foundation(foundation)
+    except (TypeError, ValidationCoreFailure) as error:
+        raise InputQualificationError("FOUNDATION_MISMATCH") from error
+    gate = _input_capture_gate(frozen_inputs, binding_publication, foundation, verifier)
+    return _execute_target_experiment_impl(
+        gate.inputs, foundation, sample_ledger, materializer, backtest, gate
+    )
+
+
 def execute_target_experiment(
     frozen_inputs: FrozenTargetExperimentInputs,
     foundation: LocalFoundation,
     sample_ledger: SampleConsumptionLedger,
     materializer: object,
     backtest: object,
+) -> PublishedStrategyCandidate | PublishedNoSelection:
+    """Publish one reserved target materialization per Trial and execute it."""
+    return _execute_target_experiment_impl(
+        frozen_inputs, foundation, sample_ledger, materializer, backtest, None
+    )
+
+
+def _execute_target_experiment_impl(
+    frozen_inputs: FrozenTargetExperimentInputs,
+    foundation: LocalFoundation,
+    sample_ledger: SampleConsumptionLedger,
+    materializer: object,
+    backtest: object,
+    capture_gate: _InputCaptureGate | None,
 ) -> PublishedStrategyCandidate | PublishedNoSelection:
     """Publish one reserved target materialization per Trial and execute it."""
 
@@ -2456,6 +2585,10 @@ def execute_target_experiment(
     _require_target_materializer(materializer, inputs.target_recipe)
     _require_target_backtest(backtest)
     base = _publish_target_base(inputs, foundation)
+    if capture_gate is not None:
+        if type(capture_gate) is not _InputCaptureGate:
+            raise TypeError("capture gate must be the private exact gate")
+        capture_gate.require_base(base)
     evidences = _recover_target_publications(base, foundation, backtest)
     existing = _replay_existing(base, foundation, sample_ledger, backtest)
     if existing is not None:
@@ -2567,4 +2700,6 @@ __all__ = [
     "execute_model_experiment",
     "execute_target_experiment",
     "preregister_target_experiment",
+    "preregister_input_capture_target_experiment",
+    "execute_input_capture_target_experiment",
 ]
