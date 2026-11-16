@@ -381,6 +381,44 @@ def test_build_children_bind_their_declared_parent(mode, wrong, tmp_path, monkey
         assert any(row["state"] == "BLOCKED" for row in view["task_rows"])
 
 
+@pytest.mark.parametrize("feature_state", ("COMPLETED", "FAILED", "ABSENT"))
+def test_partial_training_reservation_block_requires_completed_feature(feature_state, tmp_path, monkeypatch):
+    module = _module("test_integrated_research")
+    foundation, ledger, producer, port, inputs, _ = module._model_runtime(tmp_path)
+    base, _, _ = runtime._publish_model_base(inputs, foundation)
+    feature = next(task for task in base.universe if task.kind == "FEATURE_BUILD")
+    training = next(task for task in base.universe if task.kind == "MODEL_TRAINING")
+    if feature_state != "ABSENT":
+        _start(base, foundation, feature)
+    if feature_state == "COMPLETED":
+        runtime._reserve_slice(ledger, base.refs[feature.task_artifact_ref],
+                               inputs.model_build_plan.training_slice, "feature_build", inputs.reservation_at)
+        manifest = producer.build_features(inputs.model_build_plan)
+        ref, _ = runtime._publish(foundation, shell.ARTIFACT_LOG, "feature_dataset_manifest",
+                                  runtime._translate(manifest.payload, base.refs))
+        base.refs[manifest.ref] = ref
+        parent = TaskOutcome(feature, "COMPLETED", runtime.FeatureDatasetPublication(manifest.ref))
+    elif feature_state == "FAILED":
+        parent = TaskOutcome(feature, "FAILED", runtime.LocalFailure("FEATURE_FAILED"))
+    if feature_state != "ABSENT":
+        _outcome(base, foundation, parent)
+    _start(base, foundation, training)
+    _outcome(base, foundation, TaskOutcome(training, "BLOCKED", runtime.DependencyBlock("SAMPLE_RESERVATION_FAILED")))
+    before = {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    _forbid(monkeypatch, foundation, port, ledger, producer)
+    if feature_state == "COMPLETED":
+        raw = read_experiment_outcome_view(base.experiment_ref, foundation, port)
+        view = json.loads(raw)
+        assert view["closure_complete"] is False
+        assert sum(row["state"] == "COMPLETED" for row in view["task_rows"]) == 1
+        assert sum(row["state"] == "BLOCKED" for row in view["task_rows"]) == 1
+        assert raw == read_experiment_outcome_view(base.experiment_ref, foundation, port)
+    else:
+        with pytest.raises(ValueError, match="TASK_OUTCOME_INVALID"):
+            read_experiment_outcome_view(base.experiment_ref, foundation, port)
+    assert {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
 @pytest.mark.parametrize("mutation", [None, "missing", "replaced"])
 def test_native_retained_terminal_cas_is_cold_verified(mutation, tmp_path, monkeypatch):
     import hashlib

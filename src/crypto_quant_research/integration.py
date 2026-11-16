@@ -2018,6 +2018,11 @@ class TaskOutcome:
                 self.state == "COMPLETED" and type(witness) is ModelBuildPublication
             ) or (
                 self.state == "BLOCKED" and type(witness) is UpstreamTaskOutcome
+            ) or (
+                self.state == "BLOCKED"
+                and type(witness) is DependencyBlock
+                and witness.reason_code == "SAMPLE_RESERVATION_FAILED"
+                and witness.dependency_ref is None
             ) or (self.state == "FAILED" and type(witness) is LocalFailure)
         elif self.task_ref.kind == "TARGET_BUILD":
             valid = (
@@ -3041,7 +3046,11 @@ def _validate_outcome_links(
             ):
                 _fail("TASK_OUTCOME_INVALID")
         elif training_outcome.state == "BLOCKED":
-            _fail("TASK_OUTCOME_INVALID")
+            witness = training_outcome.witness
+            if not (type(witness) is DependencyBlock
+                    and witness.reason_code == "SAMPLE_RESERVATION_FAILED"
+                    and witness.dependency_ref is None):
+                _fail("TASK_OUTCOME_INVALID")
 
     if targets and set(targets) != set(trials):
         _fail("TASK_OUTCOME_INVALID")

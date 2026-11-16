@@ -704,6 +704,69 @@ def test_feature_reservation_failure_blocks_every_model_consumer(
     )
 
 
+@pytest.mark.parametrize("resume_open_attempt", (False, True))
+def test_training_reservation_failure_closes_without_training_or_backtest(tmp_path, monkeypatch, resume_open_attempt):
+    from crypto_quant_research import read_experiment_outcome_view, runtime
+    from crypto_quant_research.integration import DependencyBlock, ResearchCoreError, TaskOutcome
+    foundation, ledger, builder, provider, inputs, _ = _model_runtime(tmp_path)
+    reserve = ledger.reserve
+    purposes = []
+    def fail_training(record, producer_ref):
+        purposes.append(record.purpose)
+        if record.purpose == "model_training":
+            raise RuntimeError("synthetic training reservation failure")
+        return reserve(record, producer_ref)
+    monkeypatch.setattr(ledger, "reserve", fail_training)
+    if resume_open_attempt:
+        original = TaskOutcome.__post_init__
+        def old_constructor_fault(value):
+            if (value.task_ref.kind == "MODEL_TRAINING" and value.state == "BLOCKED"
+                    and type(value.witness) is DependencyBlock):
+                raise ResearchCoreError("TASK_OUTCOME_INVALID")
+            original(value)
+        with monkeypatch.context() as legacy:
+            legacy.setattr(TaskOutcome, "__post_init__", old_constructor_fault)
+            with pytest.raises(ResearchCoreError, match="TASK_OUTCOME_INVALID"):
+                execute_model_experiment(inputs, foundation, ledger, builder, provider)
+    result = execute_model_experiment(inputs, foundation, ledger, builder, provider)
+    assert type(result).__name__ == "PublishedNoSelection"
+    assert builder.feature_calls == 1 and builder.training_calls == 0
+    assert provider.prepare_calls == provider.run_calls == provider.derive_calls == 0
+    outcomes = _outcome_payloads(foundation)
+    assert len(outcomes) == 10
+    assert outcomes[0]["state"] == "COMPLETED"
+    assert [row["state"] for row in outcomes].count("BLOCKED") == 9
+    assert outcomes[1]["witness"] == {"dependency_block": {
+        "reason_code": "SAMPLE_RESERVATION_FAILED", "dependency_ref": None}}
+    records = [json.loads(entry.payload)["payload"]["record"] for entry in foundation.entries(_SAMPLE_LOG)]
+    assert [record["purpose"] for record in records] == ["feature_build"] + ["selection"] * len(inputs.experiment_spec.data_slices)
+    entries = [json.loads(entry.payload) for entry in foundation.entries("research.execution.v1")]
+    assert sum(row["artifact_type"] == "task_attempt_started" for row in entries) == 10
+    assert sum(row["artifact_type"] == "task_attempt_closed" for row in entries) == 10
+    assert not any(json.loads(entry.payload)["artifact_type"] in {"model_build_evidence", "strategy_candidate"}
+                   for entry in foundation.entries("research.artifacts.v1"))
+    before = {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    prior_purposes = list(purposes)
+    assert execute_model_experiment(inputs, foundation, ledger, builder, provider) == result
+    # The unchanged selection close protocol re-verifies its idempotent bookings;
+    # Feature/Training are never re-reserved, and no persisted booking is added.
+    assert purposes[len(prior_purposes):] == ["selection"] * len(inputs.experiment_spec.data_slices)
+    assert {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+    payload = foundation.read(ref=result.execution_manifest_ref).envelope.payload["experiment_ref"]
+    experiment = ArtifactRef(payload["artifact_type"], payload["schema_version"], payload["content_hash"])
+    def forbidden(*args, **kwargs):
+        pytest.fail("closed training failure view attempted a write, read or reservation")
+    for obj, names in ((foundation, ("put", "append", "checkpoint", "_clock")),
+                       (ledger, ("reserve",)), (builder, ("build_features", "train_model")),
+                       (provider, ("prepare_trials", "run", "derive"))):
+        for name in names:
+            if hasattr(obj, name):
+                monkeypatch.setattr(obj, name, forbidden)
+    view = json.loads(read_experiment_outcome_view(experiment, foundation, provider))
+    assert view["closure_complete"] is True and len(view["task_rows"]) == 10
+    assert {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
 def test_real_research_golden_replays_without_a_second_economic_run(tmp_path: Path) -> None:
     foundation, ledger, provider, inputs = _runtime(tmp_path)
 

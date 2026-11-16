@@ -562,6 +562,30 @@ def test_forged_analysis_link_and_wrong_policy_fail_closed() -> None:
     )
 
 
+def test_model_reservation_block_does_not_widen_v1_analysis_or_change_trial_wire():
+    from crypto_quant_research.integration import DependencyBlock, UpstreamTaskOutcome
+    spec = _spec()
+    tasks = build_task_universe(spec)
+    assert all(task.kind in {"TRIAL", "ANALYSIS"} for task in tasks)
+    outcomes = {}
+    for task in tasks:
+        if task.kind == "TRIAL":
+            outcome = TaskOutcome(task, "BLOCKED", DependencyBlock("SAMPLE_RESERVATION_FAILED"))
+            expected = {"task_ref": _plain(task.payload), "state": "BLOCKED",
+                        "witness": {"dependency_block": {"reason_code": "SAMPLE_RESERVATION_FAILED",
+                                                           "dependency_ref": None}}}
+            assert _wire(outcome.payload) == json.dumps(expected, sort_keys=True, separators=(",", ":"))
+            outcomes[task] = outcome
+    for task in tasks:
+        if task.kind == "ANALYSIS":
+            parent = next(trial for trial in tasks if trial.kind == "TRIAL"
+                          and trial.task_artifact_ref == task.artifact.trial_declaration_ref)
+            outcomes[task] = TaskOutcome(task, "BLOCKED", UpstreamTaskOutcome(outcomes[parent].ref))
+            _assert_code("TASK_OUTCOME_INVALID", lambda: TaskOutcome(
+                task, "BLOCKED", DependencyBlock("SAMPLE_RESERVATION_FAILED")))
+    assert len(build_execution_manifest(spec, outcomes, _cutoff(100)).task_outcome_refs) == len(tasks)
+
+
 def test_pure_core_import_boundary_and_no_duplicate_reference_types() -> None:
     source_path = (
         Path(__file__).resolve().parents[1] / "src/crypto_quant_research/integration.py"

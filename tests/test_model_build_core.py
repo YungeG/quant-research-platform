@@ -392,6 +392,59 @@ def test_ten_task_manifest_exact_cover_and_build_failure_propagation() -> None:
     )
 
 
+@pytest.mark.parametrize("parent_state,training_case,valid", (
+    ("COMPLETED", "reservation", True), ("FAILED", "upstream", True),
+    ("BLOCKED", "upstream", True), ("COMPLETED", "failed", True),
+    ("COMPLETED", "completed", True), ("FAILED", "reservation", False),
+    ("BLOCKED", "reservation", False), ("COMPLETED", "upstream", False),
+    ("FAILED", "wrong_parent", False), ("COMPLETED", "wrong_reason", False),
+    ("COMPLETED", "dependency", False),
+))
+def test_model_training_block_matrix_is_exact_at_constructor_and_manifest(parent_state, training_case, valid):
+    feature, trainer, plan = _recipes()
+    spec = _spec(plan)
+    tasks = build_task_universe(spec)
+    feature_task, training_task = tasks[:2]
+    manifest = _manifest(plan, feature)
+    evidence = validate_model_build(plan, feature, trainer, manifest, _model_artifact(feature, trainer, manifest))
+    feature_witness = (FeatureDatasetPublication(manifest.ref) if parent_state == "COMPLETED"
+                       else LocalFailure("FEATURE_FAILED") if parent_state == "FAILED"
+                       else DependencyBlock("FEATURE_DEPENDENCY"))
+    parent = TaskOutcome(feature_task, parent_state, feature_witness)
+    def build():
+        state = "BLOCKED"
+        if training_case in {"upstream", "wrong_parent"}:
+            ref = parent.ref if training_case == "upstream" else TaskOutcome(feature_task, "FAILED", LocalFailure("OTHER")).ref
+            witness = UpstreamTaskOutcome(ref)
+        elif training_case == "completed":
+            state, witness = "COMPLETED", ModelBuildPublication(evidence.ref)
+        elif training_case == "failed":
+            state, witness = "FAILED", LocalFailure("TRAINING_FAILED")
+        else:
+            witness = DependencyBlock(
+                "OTHER_REASON" if training_case == "wrong_reason" else "SAMPLE_RESERVATION_FAILED",
+                _artifact_ref("feature_dataset_manifest", "a") if training_case == "dependency" else None,
+            )
+        training = TaskOutcome(training_task, state, witness)
+        outcomes = {feature_task: parent, training_task: training}
+        for task in tasks[2:]:
+            if task.kind == "TRIAL":
+                block = DependencyBlock("NO_BACKTEST") if state == "COMPLETED" else UpstreamTaskOutcome(training.ref)
+                outcomes[task] = TaskOutcome(task, "BLOCKED", block)
+        for task in tasks[2:]:
+            if task.kind == "ANALYSIS":
+                upstream = next(trial for trial in tasks if trial.kind == "TRIAL"
+                                and trial.task_artifact_ref == task.artifact.trial_declaration_ref)
+                outcomes[task] = TaskOutcome(task, "BLOCKED", UpstreamTaskOutcome(outcomes[upstream].ref))
+        return build_execution_manifest(spec, outcomes, {
+            "log_name": "research.execution.v1", "log_sequence": 100, "receipt_hash": _hash("f"),
+        })
+    if valid:
+        assert len(build().task_outcome_refs) == 10
+    else:
+        _assert_code("TASK_OUTCOME_INVALID", build)
+
+
 def test_public_surface_adds_values_without_model_runtime_abi() -> None:
     for name in (
         "DataSlice",

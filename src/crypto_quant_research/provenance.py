@@ -13,7 +13,7 @@ from crypto_quant_validation import (
 )
 
 from .integration import (
-    AnalysisDerivation, BacktestTerminal, DataSlice, ExperimentSpec,
+    AnalysisDerivation, BacktestTerminal, DataSlice, DependencyBlock, ExperimentSpec,
     FeatureDatasetManifest, FeatureDatasetPublication, FeatureRecipe,
     LocalFailure, ModelBuildPublication, TargetBuildPublication,
     TaskAttemptClosed, TaskOutcome, TaskRef, TrialCompletedPublication,
@@ -513,7 +513,11 @@ def _validate_observed_outcome_links(
             elif not (outcome.state == "FAILED" and type(outcome.witness) is LocalFailure):
                 raise ResearchCoreError("TASK_OUTCOME_INVALID")
         elif task.kind == "MODEL_TRAINING" and outcome.state == "BLOCKED":
-            raise ResearchCoreError("TASK_OUTCOME_INVALID")
+            witness = outcome.witness
+            if not (type(witness) is DependencyBlock
+                    and witness.reason_code == "SAMPLE_RESERVATION_FAILED"
+                    and witness.dependency_ref is None):
+                raise ResearchCoreError("TASK_OUTCOME_INVALID")
 
 
 def _verify_observed_outcome_sources(
