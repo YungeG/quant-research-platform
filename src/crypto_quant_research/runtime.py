@@ -98,6 +98,42 @@ def _artifact_event_id(log_name: str, ref: ArtifactRef) -> str:
     return canonical_sha256(("artifact-publication-v1", log_name, ref))
 
 
+def _research_owner_event(envelope: ArtifactEnvelope) -> str:
+    """Interpret one Research publication identity, not its read authorization."""
+    kind = envelope.artifact_type
+    if kind in {
+        "input_qualification_declaration", "input_qualification_read_task",
+        "input_qualification_capture_binding",
+    }:
+        return _input_qualification_event(envelope)
+    if kind in {
+        "statistical_feature_read_task", "statistical_training_read_task",
+        "statistical_outcome_read_task",
+    }:
+        from .statistical_study import _task as _statistical_task
+        if type(envelope.schema_version) is not int or envelope.schema_version != 1:
+            raise ValueError("statistical task requires exact schema 1")
+        statistical_task = _statistical_task(envelope.payload)
+        if statistical_task.artifact_type != kind:
+            raise ValueError("statistical phase/producer mismatch")
+        return canonical_sha256(("statistical-read-task-publication-v1",
+                                 statistical_task.study_ref, statistical_task.phase))
+    if kind in {
+        "retrospective_input_read_task", "retrospective_feature_read_task",
+        "retrospective_training_read_task", "retrospective_outcome_read_task",
+    }:
+        from .retrospective_study import _task as _retrospective_task
+        if type(envelope.schema_version) is not int or envelope.schema_version != 1:
+            raise ValueError("retrospective task requires exact schema 1")
+        retrospective_task = _retrospective_task(envelope.payload)
+        if retrospective_task.artifact_type != kind:
+            raise ValueError("retrospective phase/producer mismatch")
+        return canonical_sha256(("retrospective-read-task-publication-v1",
+                                 retrospective_task.context_ref, retrospective_task.phase,
+                                 retrospective_task.source_slice.scope_key))
+    return _artifact_event_id(_RESEARCH_ARTIFACTS_LOG, ArtifactRef.from_envelope(envelope))
+
+
 def _translate(value: object, refs: Mapping[str, ArtifactRef]) -> object:
     def replace(item: object) -> object:
         if type(item) is str and item in refs:
@@ -170,14 +206,14 @@ def _published_entries(
             if canonical_bytes(envelope) != entry.payload:
                 raise ValueError("entry is not canonical")
             ref = ArtifactRef.from_envelope(envelope)
-            if ref.artifact_type in {
-                "input_qualification_declaration", "input_qualification_read_task",
-                "input_qualification_capture_binding",
-            }:
-                if log_name != _RESEARCH_ARTIFACTS_LOG:
-                    raise ValueError("input qualification requires its Research owner log")
-                expected_event = _input_qualification_event(envelope)
+            if log_name == _RESEARCH_ARTIFACTS_LOG:
+                expected_event = _research_owner_event(envelope)
             else:
+                if ref.artifact_type in {
+                    "input_qualification_declaration", "input_qualification_read_task",
+                    "input_qualification_capture_binding",
+                }:
+                    raise ValueError("input qualification requires its Research owner log")
                 expected_event = _artifact_event_id(log_name, ref)
             if entry.event_id != expected_event:
                 raise ValueError("entry has the wrong event id")
