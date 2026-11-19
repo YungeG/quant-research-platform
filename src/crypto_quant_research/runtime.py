@@ -945,6 +945,7 @@ def _recover_target_publications(
     trial_ref_by_wire = {
         _wire(_ref_payload(base.refs[trial.ref])): trial.ref for trial in base.trials
     }
+    task_ref_wires = {_wire(_ref_payload(base.refs[cast(str, ref)])) for ref in task_by_ref}
     for entry, ref, payload in _published_entries(foundation, _RESEARCH_ARTIFACTS_LOG):
         if ref.artifact_type == "backtest_trial_spec":
             trial_ref = trial_ref_by_wire.get(
@@ -958,6 +959,25 @@ def _recover_target_publications(
             continue
         if ref.artifact_type != "target_materialization_evidence":
             continue
+        task_ref = payload.get("target_build_task_ref")
+        trial_ref = payload.get("trial_declaration_ref")
+        for coordinate, kind in ((task_ref, "target_build_task"), (trial_ref, "trial_declaration")):
+            if (type(coordinate) is not dict
+                    or set(coordinate) != {"type", "artifact_type", "schema_version", "content_hash"}
+                    or coordinate["type"] != "artifact_ref"
+                    or coordinate["artifact_type"] != kind
+                    or type(coordinate["schema_version"]) is not int or coordinate["schema_version"] != 1):
+                raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
+            try:
+                ArtifactRef(kind, 1, coordinate["content_hash"])
+            except (TypeError, ValueError) as error:
+                raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID") from error
+        owns_task = _wire(task_ref) in task_ref_wires
+        owns_trial = _wire(trial_ref) in trial_ref_by_wire
+        if not owns_task and not owns_trial:
+            continue
+        if not owns_task or not owns_trial:
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
         converted = _reverse(payload, actual_to_core)
         if type(converted) is not dict:
             raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
@@ -977,7 +997,7 @@ def _recover_target_publications(
         task = task_by_ref.get(evidence.target_build_task_ref)
         trial = trial_by_ref.get(evidence.trial_declaration_ref)
         if task is None or trial is None or type(task.artifact) is not TargetBuildTask:
-            continue
+            raise ResearchCoreError("TARGET_MATERIALIZATION_INVALID")
         if (
             task.artifact.trial_declaration_ref != trial.ref
             or task.artifact.target_recipe_ref

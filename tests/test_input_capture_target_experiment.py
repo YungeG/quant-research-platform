@@ -84,6 +84,42 @@ def test_T8_genuine_vertical_and_completed_execution_replay(tmp_path):
         preregister_input_capture_target_experiment(inputs, pub.publication, f, verifier)
 
 
+@pytest.mark.parametrize("mixed_coordinate", [None, "target_build_task_ref", "trial_declaration_ref"])
+def test_same_capture_distinct_experiments_isolate_target_recovery(tmp_path, mixed_coordinate):
+    import json
+    from crypto_quant_research import runtime
+    from crypto_quant_research.integration import ResearchCoreError
+
+    f, ledger, verifier, _, _, _, _, pub, buffered = capture_fixture(tmp_path)
+    direct = replace(buffered, experiment_spec=replace(buffered.experiment_spec,
+        parameter_combinations=(ExperimentParameterCombination((("selector", "direct"),)),)))
+    first, second = (preregister_input_capture_target_experiment(value, pub.publication, f, verifier)
+                     for value in (buffered, direct))
+    assert first.experiment_ref != second.experiment_ref
+    earlier_materializer, earlier_port = _Materializer(f), _Backtest()
+    winner = execute(f, ledger, verifier, pub, buffered, earlier_materializer, earlier_port)
+    assert isinstance(winner, PublishedStrategyCandidate)
+    later_materializer, later_port = _Materializer(f), _Backtest()
+    if mixed_coordinate is not None:
+        evidence = next(envelope["payload"] for entry in f.entries("research.artifacts.v1")
+            if (envelope := json.loads(entry.payload))["artifact_type"] == "target_materialization_evidence")
+        ref = (second.target_build_task_refs[0] if mixed_coordinate == "target_build_task_ref"
+               else second.trial_declaration_refs[0])
+        runtime._publish(f, "research.artifacts.v1", "target_materialization_evidence",
+                         {**evidence, mixed_coordinate: ref.to_canonical_dict()})
+        with pytest.raises(ResearchCoreError) as raised:
+            execute(f, ledger, verifier, pub, direct, later_materializer, later_port)
+        assert raised.value.code == "TARGET_MATERIALIZATION_INVALID"
+        no_reads(later_materializer, later_port)
+    else:
+        control = execute(f, ledger, verifier, pub, direct, later_materializer, later_port)
+        assert isinstance(control, PublishedStrategyCandidate) and control != winner
+        assert execute(f, ledger, verifier, pub, buffered, earlier_materializer, earlier_port) == winner
+        assert execute(f, ledger, verifier, pub, direct, later_materializer, later_port) == control
+        assert earlier_materializer.calls == later_materializer.calls == 1
+        assert earlier_port.economic_run_calls == later_port.economic_run_calls == 1
+
+
 @pytest.mark.parametrize("change", ["revision", "bundle", "range"])
 @pytest.mark.parametrize("operation", ["preregister", "execute"])
 def test_T7_first_C_B_mismatch_sentinel_before_any_reader(tmp_path, change, operation):
