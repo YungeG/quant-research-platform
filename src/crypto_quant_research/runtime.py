@@ -242,28 +242,44 @@ def _require_backtest(backtest: object) -> None:
         raise TypeError("backtest must expose the frozen BT-PORT operations")
 
 
-def _load_completed(backtest: object, ref: object) -> Mapping[str, object]:
+def _load_completed(backtest: object, ref: object, *, allow_referenced: bool = False) -> Mapping[str, object]:
     try:
         version = _backtest_ref_version(ref, "completed")
     except ValueError as error:
         raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH") from error
-    operation = "load_completed" if version == 1 else "load_completed_v3"
+    if version == 3 and not allow_referenced:
+        raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH")
+    operation = {1: "load_completed", 2: "load_completed_v3", 3: "load_completed_referenced"}[version]
     loader = getattr(backtest, operation, None)
     if not callable(loader):
         raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH")
-    return loader(_plain(ref))
+    record = loader(_plain(ref))
+    if version == 3 and (not isinstance(record, Mapping) or record.get("result_grade") != "development"
+                         or _wire(record.get("publication_ref")) != _wire(ref)):
+        raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
+    return record
 
 
-def _load_analysis(backtest: object, ref: object) -> Mapping[str, object]:
+def _load_analysis(backtest: object, ref: object, *, allow_referenced: bool = False,
+                   publication_ref: object = None) -> Mapping[str, object]:
     try:
         version = _backtest_ref_version(ref, "analysis")
+        publication_version = (None if publication_ref is None
+                               else _backtest_ref_version(publication_ref, "completed"))
     except ValueError as error:
         raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH") from error
-    operation = "load_analysis" if version == 1 else "load_analysis_v2"
+    if 3 in (version, publication_version) and (not allow_referenced or version != publication_version):
+        raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH")
+    operation = {1: "load_analysis", 2: "load_analysis_v2", 3: "load_analysis_referenced"}[version]
     loader = getattr(backtest, operation, None)
     if not callable(loader):
         raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH")
-    return loader(_plain(ref))
+    record = loader(_plain(ref))
+    if version == 3 and (not isinstance(record, Mapping) or record.get("result_grade") != "development"
+                         or _wire(record.get("analysis_ref")) != _wire(ref)
+                         or _wire(record.get("source_publication_ref")) != _wire(publication_ref)):
+        raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
+    return record
 
 
 def _is_terminal_ref(value: object) -> bool:
@@ -1144,13 +1160,18 @@ def _trial_observation(
     backtest: object,
     request_spec: dict[str, object],
     trial_ref: ArtifactRef,
+    *, allow_referenced: bool = False,
 ) -> Mapping[str, object]:
     request = dict(request_spec)
     request["experiment_id"] = canonical_bytes(trial_ref).decode("utf-8")
     run_ref = backtest.run(request)
     if _is_terminal_ref(run_ref):
+        raw = _plain(run_ref)
+        if (not allow_referenced and raw["artifact_type"] == "canonical_publication_manifest"
+                and raw["schema_version"] == 3):
+            raise _RuntimeFailure("PORT_REF_TYPE_MISMATCH")
         return backtest.load_terminal(run_ref)
-    return _load_completed(backtest, run_ref)
+    return _load_completed(backtest, run_ref, allow_referenced=allow_referenced)
 
 
 def _verified_analysis(
@@ -1188,12 +1209,14 @@ def _load_verified_outcome_analyses(
 ) -> tuple[VerifiedAnalysis, ...]:
     completed: dict[str, Mapping[str, object]] = {}
     trial_outcomes: dict[str, TaskOutcome] = {}
+    allow_referenced = any(task.kind == "TARGET_BUILD" for task in outcomes)
     for task, outcome in outcomes.items():
         if task.kind != "TRIAL" or outcome.state != "COMPLETED":
             continue
         if type(outcome.witness) is not TrialCompletedPublication:
             raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
-        record = _load_completed(backtest, outcome.witness.publication_ref)
+        record = _load_completed(backtest, outcome.witness.publication_ref,
+                                 allow_referenced=allow_referenced)
         try:
             mapped = map_backtest_observation(task, record)
         except (TypeError, ValueError, ResearchCoreError) as error:
@@ -1214,7 +1237,10 @@ def _load_verified_outcome_analyses(
         if type(analysis_task) is not AnalysisTask:
             raise ResearchCoreError("SELECTION_INPUT_INCOMPLETE")
         trial_outcome = trial_outcomes.get(analysis_task.trial_declaration_ref)
-        record = _load_analysis(backtest, outcome.witness.analysis_ref)  # type: ignore[union-attr]
+        publication = (trial_outcome.witness.publication_ref if trial_outcome is not None
+                       and type(trial_outcome.witness) is TrialCompletedPublication else None)
+        record = _load_analysis(backtest, outcome.witness.analysis_ref,  # type: ignore[union-attr]
+                                allow_referenced=allow_referenced, publication_ref=publication)
         if trial_outcome is None or analysis_task.trial_declaration_ref not in completed:
             raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
         mapped = map_backtest_observation(task, record)
@@ -1731,11 +1757,12 @@ def _append_retryable_close(
 
 
 def _completed_record(
-    task: TaskRef, outcome: TaskOutcome, backtest: object
+    task: TaskRef, outcome: TaskOutcome, backtest: object, *, allow_referenced: bool = False,
 ) -> Mapping[str, object]:
     if type(outcome.witness) is not TrialCompletedPublication:
         raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
-    record = _load_completed(backtest, outcome.witness.publication_ref)
+    record = _load_completed(backtest, outcome.witness.publication_ref,
+                             allow_referenced=allow_referenced)
     mapped = map_backtest_observation(task, record)
     if _wire(mapped.payload) != _wire(outcome.payload):
         raise _RuntimeFailure("ANALYSIS_LINK_INVALID")
@@ -2117,7 +2144,8 @@ def _execute_new(
             else:
                 try:
                     record = _trial_observation(
-                        backtest, execution.request_spec, base.refs[trial.ref]
+                        backtest, execution.request_spec, base.refs[trial.ref],
+                        allow_referenced=base.inputs.experiment_spec.target_recipe_ref is not None,
                     )
                     outcome = map_backtest_observation(task, record)
                     if outcome.state == "COMPLETED":
@@ -2162,7 +2190,8 @@ def _execute_new(
             try:
                 record = completed_records.get(analysis_task.trial_declaration_ref)
                 if record is None:
-                    record = _completed_record(trial_task, trial_outcome, backtest)
+                    record = _completed_record(trial_task, trial_outcome, backtest,
+                        allow_referenced=base.inputs.experiment_spec.target_recipe_ref is not None)
                     completed_records[analysis_task.trial_declaration_ref] = record
                 publication_ref = (  # type: ignore[union-attr]
                     trial_outcome.witness.publication_ref
@@ -2170,7 +2199,8 @@ def _execute_new(
                 analysis_ref = backtest.derive(
                     _plain(publication_ref), _plain(analysis_task.metric_profile_ref)
                 )
-                analysis = _load_analysis(backtest, analysis_ref)
+                analysis = _load_analysis(backtest, analysis_ref, publication_ref=publication_ref,
+                    allow_referenced=base.inputs.experiment_spec.target_recipe_ref is not None)
                 _verified_analysis(task, trial_outcome, record, analysis)
                 outcome = map_backtest_observation(task, analysis)
             except Exception as error:  # noqa: BLE001 - frozen provider boundary

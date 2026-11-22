@@ -71,10 +71,12 @@ _BACKTEST_REF_VARIANTS = {
     "completed": {
         "backtest_canonical_publication_ref": 1,
         "backtest_canonical_publication_ref_v2": 2,
+        "backtest_canonical_publication_ref_v3": 3,
     },
     "analysis": {
         "analysis_artifact_ref": 1,
         "analysis_artifact_ref_v2": 2,
+        "analysis_artifact_ref_v3": 3,
     },
 }
 _BACKTEST_ARTIFACT_TYPES = {
@@ -1769,15 +1771,12 @@ class BacktestTerminal:
         if self.status not in _TERMINAL_STATES:
             _fail("TASK_OUTCOME_INVALID", "invalid Backtest terminal status")
         try:
-            object.__setattr__(
-                self,
-                "durable_evidence_ref",
-                _canonical_ref(
-                    self.durable_evidence_ref,
-                    "durable_evidence_ref",
-                    expected_type="artifact_ref",
-                ),
-            )
+            evidence = _canonical_ref(self.durable_evidence_ref, "durable_evidence_ref",
+                                      expected_type="artifact_ref", expected_schema_versions=(1, 3))
+            wire = _plain_json(evidence)
+            if wire["schema_version"] == 3 and wire["artifact_type"] != "canonical_publication_manifest":
+                raise ValueError("referenced terminal requires canonical_publication_manifest@3")
+            object.__setattr__(self, "durable_evidence_ref", evidence)
         except ValueError as error:
             _fail("TASK_OUTCOME_INVALID", str(error))
 
@@ -2103,6 +2102,12 @@ def map_backtest_observation(task_ref: TaskRef, observation: object) -> TaskOutc
     }:
         if task_ref.kind != "TRIAL":
             _fail("TASK_OUTCOME_INVALID")
+        try:
+            version = _backtest_ref_version(observation["publication_ref"], "completed")
+            if version == 3 and (keys != completed_fields or observation["result_grade"] != "development"):
+                raise ValueError("referenced completion accepts DEVELOPMENT economic evidence only")
+        except (KeyError, ValueError) as error:
+            _fail("TASK_OUTCOME_INVALID", str(error))
         if keys == completed_v3_fields:
             try:
                 if (
@@ -2548,10 +2553,11 @@ class VerifiedAnalysis:
                     "completed",
                 ),
             )
-            if _backtest_ref_version(self.analysis_ref, "analysis") != (
-                _backtest_ref_version(self.trial_publication_ref, "completed")
-            ):
+            version = _backtest_ref_version(self.analysis_ref, "analysis")
+            if version != _backtest_ref_version(self.trial_publication_ref, "completed"):
                 raise ValueError("analysis and publication versions must match")
+            if version == 3 and self.result_grade != "development":
+                raise ValueError("referenced analysis requires DEVELOPMENT evidence")
             object.__setattr__(
                 self,
                 "metric_profile_ref",
